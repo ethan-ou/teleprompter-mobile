@@ -5,6 +5,7 @@ import { getBoundsStart, resetTranscriptWindow } from "@/lib/speech-matcher";
 import { getNextWordIndex, tokenize, type Token } from "@/lib/word-tokenizer";
 import { Ionicons } from "@expo/vector-icons";
 import { eq } from "drizzle-orm";
+import { useLiveQuery } from "drizzle-orm/expo-sqlite";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import * as ScreenOrientation from "expo-screen-orientation";
 import { StatusBar } from "expo-status-bar";
@@ -29,6 +30,24 @@ export default function Teleprompter() {
   const tokenRefs = useRef<Map<number, View>>(new Map());
 
   const [script, setScript] = useState<any>(null);
+  const { data: scriptData } = useLiveQuery(
+    db
+      .select()
+      .from(scripts)
+      .where(eq(scripts.id, Number(id)))
+  );
+
+  useEffect(() => {
+    if (scriptData) {
+      if (scriptData.length > 0) {
+        setScript(scriptData[0]);
+      } else {
+        Alert.alert("Error", "Script not found");
+        router.back();
+      }
+    }
+  }, [scriptData, router]);
+
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMenuVisible, setIsMenuVisible] = useState(true);
   const [orientationMode, setOrientationMode] = useState<"portrait" | "landscape" | "system">(
@@ -47,8 +66,6 @@ export default function Teleprompter() {
   });
 
   useEffect(() => {
-    loadScript();
-
     return () => {
       // Cleanup
       if (recognizerRef.current?.isRunning()) {
@@ -60,7 +77,6 @@ export default function Teleprompter() {
         console.warn("Could not unlock orientation:", err)
       );
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
   // Handle orientation changes
@@ -97,7 +113,7 @@ export default function Teleprompter() {
             // Calculate target position based on alignment
             const alignmentOffsets = {
               top: screenHeight * 0.1,
-              center: screenHeight * 0.5,
+              center: screenHeight * 0.4,
               bottom: screenHeight * 0.75,
             };
 
@@ -120,6 +136,7 @@ export default function Teleprompter() {
   useEffect(() => {
     if (script?.content) {
       const newTokens = tokenize(script.content);
+      tokenRefs.current.clear();
       setTokens(newTokens);
 
       // Initialize recognizer
@@ -140,28 +157,16 @@ export default function Teleprompter() {
           },
         });
       }
+
+      // Clamp position to new token count to prevent out-of-bounds issues
+      setPosition((prev) => ({
+        start: Math.min(prev.start, newTokens.length - 1),
+        search: Math.min(prev.search, newTokens.length - 1),
+        end: Math.min(prev.end, newTokens.length - 1),
+        bounds: Math.min(prev.bounds, newTokens.length - 1),
+      }));
     }
   }, [script?.content]);
-
-  const loadScript = useCallback(async () => {
-    try {
-      const result = await db
-        .select()
-        .from(scripts)
-        .where(eq(scripts.id, Number(id)));
-
-      if (result.length > 0) {
-        setScript(result[0]);
-      } else {
-        Alert.alert("Error", "Script not found");
-        router.back();
-      }
-    } catch (error) {
-      console.error("Failed to load script:", error);
-      Alert.alert("Error", "Failed to load script");
-      router.back();
-    }
-  }, [id, router]);
 
   const togglePlayPause = useCallback(async () => {
     if (isPlaying) {
@@ -365,36 +370,62 @@ export default function Teleprompter() {
       >
         <View style={styles.scriptContainer}>
           <View style={styles.tokenWrapper}>
-            {tokens.map((token, index) => {
-              const isHighlighted =
-                isPlaying && token.index <= position.end && token.index > position.start;
-              const isCurrent = isPlaying && token.index === position.end;
-              const isPast = isPlaying && token.index <= position.start;
+            {(() => {
+              const lines: Token[][] = [];
+              let currentLine: Token[] = [];
+              tokens.forEach((token) => {
+                if (token.value === "\n") {
+                  lines.push(currentLine);
+                  currentLine = [];
+                } else {
+                  currentLine.push(token);
+                }
+              });
+              lines.push(currentLine);
 
-              return (
+              return lines.map((line, lineIndex) => (
                 <View
-                  key={token.index}
-                  ref={(ref) => {
-                    if (ref) {
-                      tokenRefs.current.set(index, ref);
-                    }
+                  key={lineIndex}
+                  style={{
+                    flexDirection: "row",
+                    flexWrap: "wrap",
+                    width: "100%",
+                    minHeight: line.length === 0 ? fontSize + 10 : 0,
                   }}
-                  style={styles.tokenContainer}
                 >
-                  <Text
-                    style={[
-                      styles.scriptText,
-                      { fontSize },
-                      isPast && styles.pastToken,
-                      isHighlighted && styles.highlightedToken,
-                      isCurrent && styles.currentToken,
-                    ]}
-                  >
-                    {token.value}
-                  </Text>
+                  {line.map((token) => {
+                    const isHighlighted =
+                      isPlaying && token.index <= position.end && token.index > position.start;
+                    const isCurrent = isPlaying && token.index === position.end;
+                    const isPast = isPlaying && token.index <= position.start;
+
+                    return (
+                      <View
+                        key={token.index}
+                        ref={(ref) => {
+                          if (ref) {
+                            tokenRefs.current.set(token.index, ref);
+                          }
+                        }}
+                        style={styles.tokenContainer}
+                      >
+                        <Text
+                          style={[
+                            styles.scriptText,
+                            { fontSize, lineHeight: fontSize + 10 },
+                            isPast && styles.pastToken,
+                            isHighlighted && styles.highlightedToken,
+                            isCurrent && styles.currentToken,
+                          ]}
+                        >
+                          {token.value}
+                        </Text>
+                      </View>
+                    );
+                  })}
                 </View>
-              );
-            })}
+              ));
+            })()}
           </View>
         </View>
       </ScrollView>
@@ -433,6 +464,7 @@ const styles = StyleSheet.create({
   controlLabel: {
     color: "#fff",
     fontSize: 9,
+    fontFamily: "Inter_400Regular",
     marginTop: 1,
   },
   playButton: {
@@ -455,20 +487,20 @@ const styles = StyleSheet.create({
     paddingBottom: 200,
   },
   scriptContainer: {
-    alignItems: "center",
+    alignItems: "flex-start",
   },
   tokenWrapper: {
     flexDirection: "row",
     flexWrap: "wrap",
-    justifyContent: "center",
+    justifyContent: "flex-start",
   },
   tokenContainer: {
     flexDirection: "row",
   },
   scriptText: {
     color: "#fff",
-    textAlign: "center",
-    fontWeight: "500",
+    textAlign: "left",
+    fontFamily: "Inter_400Regular",
     // For some reason adding padding stops text from being cut off
     paddingHorizontal: 0.0001,
     backgroundColor: "transparent",

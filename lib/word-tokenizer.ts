@@ -25,6 +25,8 @@ export const tokenize = (text: string | null) => {
       const hintLength = text.substring(i).indexOf("]");
       s = hintLength > 0 ? text.substring(i, i + hintLength + 1) : s.substring(i);
       inToken = false;
+    } else if (s === "\n") {
+      inToken = false;
     } else {
       inToken = /[A-Za-zА-Яа-я0-9_]/.test(s);
     }
@@ -33,23 +35,19 @@ export const tokenize = (text: string | null) => {
       current = {
         type: inToken ? "TOKEN" : "DELIMITER",
         value: s,
-        index: 0,
+        index: results.length,
       };
     } else if (
       (current.type === "TOKEN" && inToken) ||
-      (current.type === "DELIMITER" && !inToken)
+      (current.type === "DELIMITER" && !inToken && s !== "\n" && current.value !== "\n")
     ) {
       current.value += s;
-    } else if (
-      (current.type === "TOKEN" && !inToken) ||
-      (current.type === "DELIMITER" && inToken)
-    ) {
-      let lastIndex: number = current.index;
+    } else {
       results.push(current);
       current = {
         type: inToken ? "TOKEN" : "DELIMITER",
         value: s,
-        index: lastIndex + 1,
+        index: results.length,
       };
     }
 

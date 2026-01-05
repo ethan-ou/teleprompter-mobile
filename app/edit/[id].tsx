@@ -3,7 +3,7 @@ import { scripts } from "@/db/schema";
 import { Ionicons } from "@expo/vector-icons";
 import { eq } from "drizzle-orm";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   Alert,
   KeyboardAvoidingView,
@@ -24,15 +24,7 @@ export default function EditScript() {
   const [content, setContent] = useState("");
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    if (id && id !== "new") {
-      loadScript();
-    } else {
-      setLoading(false);
-    }
-  }, [id]);
-
-  const loadScript = async () => {
+  const loadScript = useCallback(async () => {
     try {
       const result = await db
         .select()
@@ -49,7 +41,15 @@ export default function EditScript() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [id]);
+
+  useEffect(() => {
+    if (id && id !== "new") {
+      loadScript();
+    } else {
+      setLoading(false);
+    }
+  }, [id, loadScript]);
 
   const saveScript = async () => {
     if (!title.trim()) {
@@ -82,27 +82,6 @@ export default function EditScript() {
       console.error("Failed to save script:", error);
       Alert.alert("Error", "Failed to save script");
     }
-  };
-
-  const deleteScript = async () => {
-    if (!id || id === "new") return;
-
-    Alert.alert("Delete Script", "Are you sure you want to delete this script?", [
-      { text: "Cancel", style: "cancel" },
-      {
-        text: "Delete",
-        style: "destructive",
-        onPress: async () => {
-          try {
-            await db.delete(scripts).where(eq(scripts.id, Number(id)));
-            router.back();
-          } catch (error) {
-            console.error("Failed to delete script:", error);
-            Alert.alert("Error", "Failed to delete script");
-          }
-        },
-      },
-    ]);
   };
 
   if (loading) {
@@ -147,13 +126,6 @@ export default function EditScript() {
           placeholderTextColor="#999"
         />
       </View>
-
-      {id && id !== "new" && (
-        <TouchableOpacity style={styles.deleteButton} onPress={deleteScript}>
-          <Ionicons name="trash-outline" size={24} color="#FF3B30" />
-          <Text style={styles.deleteText}>Delete Script</Text>
-        </TouchableOpacity>
-      )}
     </KeyboardAvoidingView>
   );
 }
@@ -177,12 +149,12 @@ const styles = StyleSheet.create({
   },
   headerTitle: {
     fontSize: 18,
-    fontWeight: "600",
+    fontFamily: "Inter_600SemiBold",
   },
   saveText: {
     fontSize: 17,
     color: "#007AFF",
-    fontWeight: "600",
+    fontFamily: "Inter_600SemiBold",
     textAlign: "right",
   },
   content: {
@@ -191,30 +163,15 @@ const styles = StyleSheet.create({
   },
   titleInput: {
     fontSize: 24,
-    fontWeight: "600",
+    fontFamily: "Inter_600SemiBold",
     marginBottom: 20,
     padding: 0,
   },
   contentInput: {
     flex: 1,
     fontSize: 18,
+    fontFamily: "Inter_400Regular",
     lineHeight: 28,
     padding: 0,
-  },
-  deleteButton: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    padding: 16,
-    marginHorizontal: 16,
-    marginBottom: 32,
-    borderRadius: 12,
-    backgroundColor: "#FFF0F0",
-    gap: 8,
-  },
-  deleteText: {
-    fontSize: 17,
-    color: "#FF3B30",
-    fontWeight: "600",
   },
 });

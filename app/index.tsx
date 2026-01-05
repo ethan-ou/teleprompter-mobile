@@ -199,7 +199,7 @@ const styles = StyleSheet.create({
   },
   title: {
     fontSize: 28,
-    fontWeight: "bold",
+    fontFamily: "Inter_700Bold",
   },
   menuButton: {
     padding: 8,
@@ -275,11 +275,12 @@ const styles = StyleSheet.create({
   },
   scriptTitle: {
     fontSize: 18,
-    fontWeight: "600",
+    fontFamily: "Inter_600SemiBold",
     marginBottom: 8,
   },
   scriptPreview: {
     fontSize: 14,
+    fontFamily: "Inter_400Regular",
     color: "#666",
     lineHeight: 20,
   },
@@ -292,7 +293,7 @@ const styles = StyleSheet.create({
   cancelText: {
     fontSize: 17,
     color: "#007AFF",
-    fontWeight: "600",
+    fontFamily: "Inter_600SemiBold",
   },
   deleteButton: {
     padding: 8,
@@ -307,12 +308,13 @@ const styles = StyleSheet.create({
   },
   emptyText: {
     fontSize: 20,
-    fontWeight: "600",
+    fontFamily: "Inter_600SemiBold",
     color: "#999",
     marginTop: 16,
   },
   emptySubtext: {
     fontSize: 16,
+    fontFamily: "Inter_400Regular",
     color: "#ccc",
     marginTop: 8,
   },
