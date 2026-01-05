@@ -30,7 +30,13 @@ export default function Teleprompter() {
 
   const [script, setScript] = useState<any>(null);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [isMenuVisible, setIsMenuVisible] = useState(true);
+  const [orientationMode, setOrientationMode] = useState<"portrait" | "landscape" | "system">(
+    "landscape"
+  );
+  const [isMirrored, setIsMirrored] = useState(false);
   const [fontSize, setFontSize] = useState(32);
+  const [margin, setMargin] = useState(10);
   const [align, setAlign] = useState<"top" | "center" | "bottom">("center");
   const [tokens, setTokens] = useState<Token[]>([]);
   const [position, setPosition] = useState<Position>({
@@ -42,11 +48,6 @@ export default function Teleprompter() {
 
   useEffect(() => {
     loadScript();
-
-    // Lock to landscape mode when entering teleprompter
-    ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.LANDSCAPE).catch((err) =>
-      console.warn("Could not lock orientation:", err)
-    );
 
     return () => {
       // Cleanup
@@ -61,6 +62,25 @@ export default function Teleprompter() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
+
+  // Handle orientation changes
+  useEffect(() => {
+    const applyOrientation = async () => {
+      try {
+        if (orientationMode === "portrait") {
+          await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP);
+        } else if (orientationMode === "landscape") {
+          await ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.LANDSCAPE);
+        } else {
+          await ScreenOrientation.unlockAsync();
+        }
+      } catch (err) {
+        console.warn("Could not set orientation:", err);
+      }
+    };
+
+    applyOrientation();
+  }, [orientationMode]);
 
   // Auto-scroll to highlighted word in voice mode
   useEffect(() => {
@@ -193,6 +213,10 @@ export default function Teleprompter() {
     setFontSize((prev) => Math.max(16, Math.min(72, prev + delta)));
   };
 
+  const adjustMargin = (delta: number) => {
+    setMargin((prev) => Math.max(0, Math.min(40, prev + delta)));
+  };
+
   if (!script) {
     return (
       <View style={styles.container}>
@@ -205,56 +229,136 @@ export default function Teleprompter() {
     <View style={styles.container}>
       <StatusBar hidden />
       {/* Control Bar */}
-      <View style={[styles.controlBar, { paddingTop: insets.top + 16 }]}>
-        <TouchableOpacity style={styles.controlButton} onPress={() => router.back()}>
-          <Ionicons name="close" size={28} color="#fff" />
-        </TouchableOpacity>
+      {isMenuVisible && (
+        <View style={[styles.controlBar, { paddingTop: insets.top + 8 }]}>
+          <View style={{ flexDirection: "row", gap: 12 }}>
+            <TouchableOpacity style={styles.controlButton} onPress={() => router.back()}>
+              <Ionicons name="close" size={24} color="#fff" />
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.controlButton}
+              onPress={() => router.push(`/edit/${id}`)}
+            >
+              <Ionicons name="create-outline" size={24} color="#fff" />
+            </TouchableOpacity>
+          </View>
 
-        <View style={styles.centerControls}>
-          <TouchableOpacity
-            style={[styles.playButton, isPlaying && styles.playButtonActive]}
-            onPress={togglePlayPause}
-          >
-            <Ionicons name={isPlaying ? "pause" : "play"} size={32} color="#fff" />
-          </TouchableOpacity>
+          <View style={styles.centerControls}>
+            <TouchableOpacity
+              style={[styles.playButton, isPlaying && styles.playButtonActive]}
+              onPress={togglePlayPause}
+            >
+              <Ionicons name={isPlaying ? "pause" : "play"} size={28} color="#fff" />
+            </TouchableOpacity>
 
-          <TouchableOpacity style={styles.controlButton} onPress={resetScroll}>
-            <Ionicons name="refresh-outline" size={28} color="#fff" />
-          </TouchableOpacity>
+            <TouchableOpacity style={styles.controlButton} onPress={resetScroll}>
+              <Ionicons name="refresh-outline" size={24} color="#fff" />
+              <Text style={styles.controlLabel}>Reset</Text>
+            </TouchableOpacity>
 
-          <TouchableOpacity style={styles.controlButton} onPress={() => adjustFontSize(-4)}>
-            <Ionicons name="text-outline" size={20} color="#fff" />
-            <Text style={styles.controlLabel}>-</Text>
-          </TouchableOpacity>
+            <View style={{ flexDirection: "row", alignItems: "center" }}>
+              <TouchableOpacity style={styles.controlButton} onPress={() => adjustFontSize(-4)}>
+                <Ionicons name="remove-circle-outline" size={24} color="#fff" />
+              </TouchableOpacity>
+              <Ionicons name="text-outline" size={18} color="#fff" />
+              <TouchableOpacity style={styles.controlButton} onPress={() => adjustFontSize(4)}>
+                <Ionicons name="add-circle-outline" size={24} color="#fff" />
+              </TouchableOpacity>
+            </View>
 
-          <TouchableOpacity style={styles.controlButton} onPress={() => adjustFontSize(4)}>
-            <Ionicons name="text-outline" size={28} color="#fff" />
-            <Text style={styles.controlLabel}>+</Text>
-          </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.controlButton}
+              onPress={() => {
+                const alignments: ("top" | "center" | "bottom")[] = ["top", "center", "bottom"];
+                const currentIndex = alignments.indexOf(align);
+                setAlign(alignments[(currentIndex + 1) % alignments.length]);
+              }}
+            >
+              <Ionicons
+                name={
+                  align === "top" ? "chevron-up" : align === "center" ? "remove" : "chevron-down"
+                }
+                size={24}
+                color="#fff"
+              />
+              <Text style={styles.controlLabel}>{align}</Text>
+            </TouchableOpacity>
 
-          <TouchableOpacity
-            style={styles.controlButton}
-            onPress={() => {
-              const alignments: ("top" | "center" | "bottom")[] = ["top", "center", "bottom"];
-              const currentIndex = alignments.indexOf(align);
-              setAlign(alignments[(currentIndex + 1) % alignments.length]);
-            }}
-          >
-            <Ionicons
-              name={align === "top" ? "chevron-up" : align === "center" ? "remove" : "chevron-down"}
-              size={28}
-              color="#fff"
-            />
-            <Text style={styles.controlLabel}>{align}</Text>
-          </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.controlButton}
+              onPress={() => {
+                const modes: ("portrait" | "landscape" | "system")[] = [
+                  "portrait",
+                  "landscape",
+                  "system",
+                ];
+                const currentIndex = modes.indexOf(orientationMode);
+                setOrientationMode(modes[(currentIndex + 1) % modes.length]);
+              }}
+            >
+              <Ionicons
+                name={
+                  orientationMode === "portrait"
+                    ? "phone-portrait-outline"
+                    : orientationMode === "landscape"
+                    ? "phone-landscape-outline"
+                    : "sync-outline"
+                }
+                size={24}
+                color="#fff"
+              />
+              <Text style={styles.controlLabel}>{orientationMode}</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.controlButton, isMirrored && styles.controlButtonActive]}
+              onPress={() => setIsMirrored(!isMirrored)}
+            >
+              <Ionicons name="swap-horizontal-outline" size={24} color="#fff" />
+              <Text style={styles.controlLabel}>Mirror</Text>
+            </TouchableOpacity>
+
+            <View style={{ flexDirection: "row", alignItems: "center" }}>
+              <TouchableOpacity style={styles.controlButton} onPress={() => adjustMargin(-2)}>
+                <Ionicons name="remove-circle-outline" size={24} color="#fff" />
+              </TouchableOpacity>
+              <Ionicons name="resize-outline" size={18} color="#fff" />
+              <TouchableOpacity style={styles.controlButton} onPress={() => adjustMargin(2)}>
+                <Ionicons name="add-circle-outline" size={24} color="#fff" />
+              </TouchableOpacity>
+            </View>
+          </View>
         </View>
-      </View>
+      )}
+
+      <TouchableOpacity
+        style={[
+          styles.handleArea,
+          !isMenuVisible && {
+            position: "absolute",
+            top: 0,
+            zIndex: 100,
+            paddingTop: insets.top,
+            height: insets.top + 20,
+          },
+        ]}
+        onPress={() => setIsMenuVisible(!isMenuVisible)}
+        activeOpacity={0.7}
+      >
+        <View style={styles.handleBar} />
+      </TouchableOpacity>
 
       {/* Script Content */}
       <ScrollView
         ref={scrollViewRef}
-        style={styles.scrollView}
-        contentContainerStyle={styles.scrollContent}
+        style={[styles.scrollView, isMirrored && { transform: [{ scaleX: -1 }] }]}
+        contentContainerStyle={[
+          styles.scrollContent,
+          {
+            paddingLeft: `${margin}%`,
+            paddingRight: `${margin * 0.8 - Math.min(fontSize / 80, 1) * 0.4}%`,
+          },
+        ]}
         scrollEnabled={!isPlaying}
         showsVerticalScrollIndicator={false}
         scrollEventThrottle={16}
@@ -307,34 +411,38 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    paddingHorizontal: 20,
-    paddingVertical: 16,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
     backgroundColor: "rgba(0, 0, 0, 0.8)",
     borderBottomWidth: 1,
-    borderBottomColor: "#333",
+    borderBottomColor: "#222",
   },
   centerControls: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 20,
+    gap: 16,
   },
   controlButton: {
     alignItems: "center",
     justifyContent: "center",
+    minWidth: 40,
+  },
+  controlButtonActive: {
+    opacity: 0.5,
   },
   controlLabel: {
     color: "#fff",
-    fontSize: 10,
-    marginTop: 2,
+    fontSize: 9,
+    marginTop: 1,
   },
   playButton: {
-    width: 56,
-    height: 56,
-    borderRadius: 28,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
     backgroundColor: "#007AFF",
     alignItems: "center",
     justifyContent: "center",
-    marginHorizontal: 10,
+    marginHorizontal: 4,
   },
   playButtonActive: {
     backgroundColor: "#FF3B30",
@@ -343,9 +451,8 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   scrollContent: {
-    paddingTop: 100,
+    paddingTop: 80,
     paddingBottom: 200,
-    paddingHorizontal: 40,
   },
   scriptContainer: {
     alignItems: "center",
@@ -362,16 +469,31 @@ const styles = StyleSheet.create({
     color: "#fff",
     textAlign: "center",
     fontWeight: "500",
+    // For some reason adding padding stops text from being cut off
+    paddingHorizontal: 0.0001,
+    backgroundColor: "transparent",
   },
   highlightedToken: {
-    backgroundColor: "rgba(255, 215, 0, 0.3)",
+    color: "#FFD700",
   },
   currentToken: {
-    backgroundColor: "rgba(255, 215, 0, 0.5)",
-    fontWeight: "700",
+    color: "#FFD700",
   },
   pastToken: {
     color: "#666",
+  },
+  handleArea: {
+    width: "100%",
+    height: 10,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "transparent",
+  },
+  handleBar: {
+    width: 100,
+    height: 5,
+    borderRadius: 1.5,
+    backgroundColor: "rgba(255, 255, 255, 0.5)",
   },
   guideLine: {
     position: "absolute",

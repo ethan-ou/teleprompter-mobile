@@ -14,9 +14,11 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 export default function EditScript() {
   const router = useRouter();
+  const insets = useSafeAreaInsets();
   const { id } = useLocalSearchParams();
   const [title, setTitle] = useState("");
   const [content, setContent] = useState("");
@@ -116,7 +118,7 @@ export default function EditScript() {
       style={styles.container}
       behavior={Platform.OS === "ios" ? "padding" : "height"}
     >
-      <View style={styles.header}>
+      <View style={[styles.header, { paddingTop: insets.top + 16 }]}>
         <TouchableOpacity style={styles.headerButton} onPress={() => router.back()}>
           <Ionicons name="close" size={28} color="#007AFF" />
         </TouchableOpacity>
@@ -166,7 +168,6 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     alignItems: "center",
     paddingHorizontal: 16,
-    paddingTop: 60,
     paddingBottom: 16,
     borderBottomWidth: 1,
     borderBottomColor: "#e0e0e0",
