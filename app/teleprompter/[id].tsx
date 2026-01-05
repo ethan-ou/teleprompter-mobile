@@ -1,10 +1,14 @@
 import { db } from "@/db";
 import { scripts } from "@/db/schema";
+import { TeleprompterRecognizer, type Position } from "@/lib/recognizer";
+import { getBoundsStart, resetTranscriptWindow } from "@/lib/speech-matcher";
+import { getNextWordIndex, tokenize, type Token } from "@/lib/word-tokenizer";
 import { Ionicons } from "@expo/vector-icons";
 import { eq } from "drizzle-orm";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import * as ScreenOrientation from "expo-screen-orientation";
-import { useEffect, useRef, useState } from "react";
+import { StatusBar } from "expo-status-bar";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Alert,
   Dimensions,
@@ -14,17 +18,27 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 export default function Teleprompter() {
   const { id } = useLocalSearchParams();
   const router = useRouter();
+  const insets = useSafeAreaInsets();
   const scrollViewRef = useRef<ScrollView>(null);
+  const recognizerRef = useRef<TeleprompterRecognizer | null>(null);
+  const tokenRefs = useRef<Map<number, View>>(new Map());
+
   const [script, setScript] = useState<any>(null);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [speed, setSpeed] = useState(50);
   const [fontSize, setFontSize] = useState(32);
-  const [scrollPosition, setScrollPosition] = useState(0);
-  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const [align, setAlign] = useState<"top" | "center" | "bottom">("center");
+  const [tokens, setTokens] = useState<Token[]>([]);
+  const [position, setPosition] = useState<Position>({
+    start: -1,
+    search: -1,
+    end: -1,
+    bounds: -1,
+  });
 
   useEffect(() => {
     loadScript();
@@ -35,43 +49,81 @@ export default function Teleprompter() {
     );
 
     return () => {
+      // Cleanup
+      if (recognizerRef.current?.isRunning()) {
+        recognizerRef.current.stop();
+      }
+
       // Unlock orientation when leaving
       ScreenOrientation.unlockAsync().catch((err) =>
         console.warn("Could not unlock orientation:", err)
       );
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-      }
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
+  // Auto-scroll to highlighted word in voice mode
   useEffect(() => {
-    if (isPlaying) {
-      intervalRef.current = setInterval(() => {
-        setScrollPosition((prev) => {
-          const newPosition = prev + speed / 10;
-          scrollViewRef.current?.scrollTo({
-            y: newPosition,
-            animated: false,
-          });
-          return newPosition;
-        });
-      }, 50);
-    } else {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-        intervalRef.current = null;
+    if (isPlaying && position.end >= 0) {
+      const nextWordIndex = getNextWordIndex(tokens, position.end);
+      const tokenRef = tokenRefs.current.get(nextWordIndex);
+
+      if (tokenRef) {
+        tokenRef.measureLayout(
+          scrollViewRef.current as any,
+          (x, y) => {
+            const screenHeight = Dimensions.get("window").height;
+
+            // Calculate target position based on alignment
+            const alignmentOffsets = {
+              top: screenHeight * 0.1,
+              center: screenHeight * 0.5,
+              bottom: screenHeight * 0.75,
+            };
+
+            const targetY = y - alignmentOffsets[align];
+
+            scrollViewRef.current?.scrollTo({
+              y: Math.max(0, targetY),
+              animated: true,
+            });
+          },
+          () => {
+            // Measurement failed, ignore
+          }
+        );
       }
     }
+  }, [position.end, isPlaying, tokens, align]);
 
-    return () => {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
+  // Tokenize script content
+  useEffect(() => {
+    if (script?.content) {
+      const newTokens = tokenize(script.content);
+      setTokens(newTokens);
+
+      // Initialize recognizer
+      if (recognizerRef.current) {
+        recognizerRef.current.updateTokens(newTokens);
+      } else {
+        recognizerRef.current = new TeleprompterRecognizer(newTokens, {
+          onPositionUpdate: (newPosition) => {
+            setPosition(newPosition);
+          },
+          onError: (error) => {
+            console.error("Speech recognition error:", error);
+            Alert.alert("Voice Recognition Error", error.message || "An error occurred");
+            setIsPlaying(false);
+          },
+          onEnd: () => {
+            setIsPlaying(false);
+          },
+        });
       }
-    };
-  }, [isPlaying, speed]);
+    }
+  }, [script?.content]);
 
-  const loadScript = async () => {
+  const loadScript = useCallback(async () => {
     try {
       const result = await db
         .select()
@@ -89,20 +141,52 @@ export default function Teleprompter() {
       Alert.alert("Error", "Failed to load script");
       router.back();
     }
-  };
+  }, [id, router]);
 
-  const togglePlayPause = () => {
-    setIsPlaying(!isPlaying);
-  };
+  const togglePlayPause = useCallback(async () => {
+    if (isPlaying) {
+      // Stop voice recognition
+      recognizerRef.current?.stop();
+      setIsPlaying(false);
+    } else {
+      // Start voice recognition
+      try {
+        await recognizerRef.current?.start();
+        setIsPlaying(true);
+      } catch (error) {
+        console.error("Failed to start voice recognition:", error);
+        Alert.alert(
+          "Voice Recognition Error",
+          "Failed to start voice recognition. Please check microphone permissions."
+        );
+      }
+    }
+  }, [isPlaying]);
 
   const resetScroll = () => {
-    setScrollPosition(0);
     scrollViewRef.current?.scrollTo({ y: 0, animated: true });
     setIsPlaying(false);
-  };
 
-  const adjustSpeed = (delta: number) => {
-    setSpeed((prev) => Math.max(10, Math.min(200, prev + delta)));
+    // Reset position
+    const newPosition: Position = {
+      start: -1,
+      search: -1,
+      end: -1,
+      bounds: -1,
+    };
+    setPosition(newPosition);
+
+    if (recognizerRef.current) {
+      recognizerRef.current.stop();
+      recognizerRef.current.reset();
+      const bounds = getBoundsStart(tokens, 0);
+      if (bounds !== undefined) {
+        const updatedPosition = { ...newPosition, bounds };
+        setPosition(updatedPosition);
+        recognizerRef.current.updatePosition(updatedPosition);
+      }
+    }
+    resetTranscriptWindow();
   };
 
   const adjustFontSize = (delta: number) => {
@@ -119,25 +203,14 @@ export default function Teleprompter() {
 
   return (
     <View style={styles.container}>
+      <StatusBar hidden />
       {/* Control Bar */}
-      <View style={styles.controlBar}>
+      <View style={[styles.controlBar, { paddingTop: insets.top + 16 }]}>
         <TouchableOpacity style={styles.controlButton} onPress={() => router.back()}>
           <Ionicons name="close" size={28} color="#fff" />
         </TouchableOpacity>
 
         <View style={styles.centerControls}>
-          <TouchableOpacity style={styles.controlButton} onPress={() => adjustSpeed(-10)}>
-            <Ionicons name="remove-circle-outline" size={24} color="#fff" />
-            <Text style={styles.controlLabel}>Speed</Text>
-          </TouchableOpacity>
-
-          <Text style={styles.speedText}>{speed}</Text>
-
-          <TouchableOpacity style={styles.controlButton} onPress={() => adjustSpeed(10)}>
-            <Ionicons name="add-circle-outline" size={24} color="#fff" />
-            <Text style={styles.controlLabel}>Speed</Text>
-          </TouchableOpacity>
-
           <TouchableOpacity
             style={[styles.playButton, isPlaying && styles.playButtonActive]}
             onPress={togglePlayPause}
@@ -158,6 +231,22 @@ export default function Teleprompter() {
             <Ionicons name="text-outline" size={28} color="#fff" />
             <Text style={styles.controlLabel}>+</Text>
           </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.controlButton}
+            onPress={() => {
+              const alignments: ("top" | "center" | "bottom")[] = ["top", "center", "bottom"];
+              const currentIndex = alignments.indexOf(align);
+              setAlign(alignments[(currentIndex + 1) % alignments.length]);
+            }}
+          >
+            <Ionicons
+              name={align === "top" ? "chevron-up" : align === "center" ? "remove" : "chevron-down"}
+              size={28}
+              color="#fff"
+            />
+            <Text style={styles.controlLabel}>{align}</Text>
+          </TouchableOpacity>
         </View>
       </View>
 
@@ -168,20 +257,43 @@ export default function Teleprompter() {
         contentContainerStyle={styles.scrollContent}
         scrollEnabled={!isPlaying}
         showsVerticalScrollIndicator={false}
-        onScroll={(e) => {
-          if (!isPlaying) {
-            setScrollPosition(e.nativeEvent.contentOffset.y);
-          }
-        }}
         scrollEventThrottle={16}
       >
         <View style={styles.scriptContainer}>
-          <Text style={[styles.scriptText, { fontSize }]}>{script.content}</Text>
+          <View style={styles.tokenWrapper}>
+            {tokens.map((token, index) => {
+              const isHighlighted =
+                isPlaying && token.index <= position.end && token.index > position.start;
+              const isCurrent = isPlaying && token.index === position.end;
+              const isPast = isPlaying && token.index <= position.start;
+
+              return (
+                <View
+                  key={token.index}
+                  ref={(ref) => {
+                    if (ref) {
+                      tokenRefs.current.set(index, ref);
+                    }
+                  }}
+                  style={styles.tokenContainer}
+                >
+                  <Text
+                    style={[
+                      styles.scriptText,
+                      { fontSize },
+                      isPast && styles.pastToken,
+                      isHighlighted && styles.highlightedToken,
+                      isCurrent && styles.currentToken,
+                    ]}
+                  >
+                    {token.value}
+                  </Text>
+                </View>
+              );
+            })}
+          </View>
         </View>
       </ScrollView>
-
-      {/* Reading Guide Line */}
-      <View style={styles.guideLine} />
     </View>
   );
 }
@@ -215,13 +327,6 @@ const styles = StyleSheet.create({
     fontSize: 10,
     marginTop: 2,
   },
-  speedText: {
-    color: "#fff",
-    fontSize: 18,
-    fontWeight: "600",
-    minWidth: 40,
-    textAlign: "center",
-  },
   playButton: {
     width: 56,
     height: 56,
@@ -238,22 +343,38 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   scrollContent: {
-    paddingTop: 200,
-    paddingBottom: Dimensions.get("window").height,
+    paddingTop: 100,
+    paddingBottom: 200,
     paddingHorizontal: 40,
   },
   scriptContainer: {
     alignItems: "center",
   },
+  tokenWrapper: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    justifyContent: "center",
+  },
+  tokenContainer: {
+    flexDirection: "row",
+  },
   scriptText: {
     color: "#fff",
-    lineHeight: 1.8,
     textAlign: "center",
     fontWeight: "500",
   },
+  highlightedToken: {
+    backgroundColor: "rgba(255, 215, 0, 0.3)",
+  },
+  currentToken: {
+    backgroundColor: "rgba(255, 215, 0, 0.5)",
+    fontWeight: "700",
+  },
+  pastToken: {
+    color: "#666",
+  },
   guideLine: {
     position: "absolute",
-    top: "30%",
     left: 0,
     right: 0,
     height: 3,

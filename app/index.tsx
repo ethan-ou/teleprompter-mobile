@@ -12,6 +12,7 @@ export default function Index() {
   const { data: scriptList } = useLiveQuery(db.select().from(scripts));
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
+  const [menuVisible, setMenuVisible] = useState(false);
 
   const handleLongPress = (id: number) => {
     setSelectionMode(true);
@@ -87,12 +88,41 @@ export default function Index() {
         ) : (
           <>
             <Text style={styles.title}>Scripts</Text>
-            <TouchableOpacity style={styles.addButton} onPress={() => router.push("/edit")}>
-              <Ionicons name="add" size={28} color="#fff" />
+            <TouchableOpacity
+              style={styles.menuButton}
+              onPress={() => setMenuVisible(!menuVisible)}
+            >
+              <Ionicons name="ellipsis-vertical" size={24} color="#000" />
             </TouchableOpacity>
           </>
         )}
       </View>
+
+      {/* Dropdown Menu */}
+      {menuVisible && !selectionMode && (
+        <View style={styles.menuContainer}>
+          <TouchableOpacity
+            style={styles.menuItem}
+            onPress={() => {
+              setMenuVisible(false);
+              router.push("/edit");
+            }}
+          >
+            <Ionicons name="add-outline" size={20} color="#000" />
+            <Text style={styles.menuItemText}>New Script</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.menuItem}
+            onPress={() => {
+              setMenuVisible(false);
+              setSelectionMode(true);
+            }}
+          >
+            <Ionicons name="trash-outline" size={20} color="#000" />
+            <Text style={styles.menuItemText}>Delete Scripts</Text>
+          </TouchableOpacity>
+        </View>
+      )}
 
       <FlatList
         data={scriptList || []}
@@ -140,6 +170,13 @@ export default function Index() {
           </View>
         }
       />
+
+      {/* Floating Action Button */}
+      {!selectionMode && (
+        <TouchableOpacity style={styles.fab} onPress={() => router.push("/edit")}>
+          <Ionicons name="add" size={32} color="#fff" />
+        </TouchableOpacity>
+      )}
     </View>
   );
 }
@@ -162,6 +199,49 @@ const styles = StyleSheet.create({
   title: {
     fontSize: 28,
     fontWeight: "bold",
+  },
+  menuButton: {
+    padding: 8,
+  },
+  menuContainer: {
+    position: "absolute",
+    top: 100,
+    right: 16,
+    backgroundColor: "#fff",
+    borderRadius: 8,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 4,
+    elevation: 5,
+    minWidth: 160,
+    zIndex: 1000,
+  },
+  menuItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    padding: 16,
+    gap: 12,
+  },
+  menuItemText: {
+    fontSize: 16,
+    color: "#000",
+  },
+  fab: {
+    position: "absolute",
+    bottom: 24,
+    right: 24,
+    backgroundColor: "#007AFF",
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    justifyContent: "center",
+    alignItems: "center",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 6,
+    elevation: 8,
   },
   addButton: {
     backgroundColor: "#007AFF",
