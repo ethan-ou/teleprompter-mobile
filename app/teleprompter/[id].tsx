@@ -3,7 +3,7 @@ import { scripts } from "@/db/schema";
 import { TeleprompterRecognizer, type Position } from "@/lib/recognizer";
 import { getBoundsStart, resetTranscriptWindow } from "@/lib/speech-matcher";
 import { getNextWordIndex, tokenize, type Token } from "@/lib/word-tokenizer";
-import { Ionicons } from "@expo/vector-icons";
+import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { eq } from "drizzle-orm";
 import { useLiveQuery } from "drizzle-orm/expo-sqlite";
 import { useLocalSearchParams, useRouter } from "expo-router";
@@ -236,19 +236,13 @@ export default function Teleprompter() {
       {/* Control Bar */}
       {isMenuVisible && (
         <View style={[styles.controlBar, { paddingTop: insets.top + 8 }]}>
-          <View style={{ flexDirection: "row", gap: 12 }}>
-            <TouchableOpacity style={styles.controlButton} onPress={() => router.back()}>
-              <Ionicons name="close" size={24} color="#fff" />
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={styles.controlButton}
-              onPress={() => router.push(`/edit/${id}`)}
-            >
-              <Ionicons name="create-outline" size={24} color="#fff" />
-            </TouchableOpacity>
-          </View>
+          {/* Group 0: Back */}
+          <TouchableOpacity style={styles.controlButton} onPress={() => router.back()}>
+            <Ionicons name="close" size={28} color="#fff" />
+          </TouchableOpacity>
 
-          <View style={styles.centerControls}>
+          {/* Group 1: Play, Reset, Edit */}
+          <View style={styles.controlGroup}>
             <TouchableOpacity
               style={[styles.playButton, isPlaying && styles.playButtonActive]}
               onPress={togglePlayPause}
@@ -261,16 +255,17 @@ export default function Teleprompter() {
               <Text style={styles.controlLabel}>Reset</Text>
             </TouchableOpacity>
 
-            <View style={{ flexDirection: "row", alignItems: "center" }}>
-              <TouchableOpacity style={styles.controlButton} onPress={() => adjustFontSize(-4)}>
-                <Ionicons name="remove-circle-outline" size={24} color="#fff" />
-              </TouchableOpacity>
-              <Ionicons name="text-outline" size={18} color="#fff" />
-              <TouchableOpacity style={styles.controlButton} onPress={() => adjustFontSize(4)}>
-                <Ionicons name="add-circle-outline" size={24} color="#fff" />
-              </TouchableOpacity>
-            </View>
+            <TouchableOpacity
+              style={styles.controlButton}
+              onPress={() => router.push(`/edit/${id}`)}
+            >
+              <Ionicons name="create-outline" size={24} color="#fff" />
+              <Text style={styles.controlLabel}>Edit</Text>
+            </TouchableOpacity>
+          </View>
 
+          {/* Group 2: Alignment, Orientation, Mirror */}
+          <View style={styles.controlGroup}>
             <TouchableOpacity
               style={styles.controlButton}
               onPress={() => {
@@ -322,12 +317,25 @@ export default function Teleprompter() {
               <Ionicons name="swap-horizontal-outline" size={24} color="#fff" />
               <Text style={styles.controlLabel}>Mirror</Text>
             </TouchableOpacity>
+          </View>
 
-            <View style={{ flexDirection: "row", alignItems: "center" }}>
+          {/* Group 3: Font size, Margin */}
+          <View style={styles.controlGroup}>
+            <View style={styles.stepperContainer}>
+              <TouchableOpacity style={styles.controlButton} onPress={() => adjustFontSize(-4)}>
+                <Ionicons name="remove-circle-outline" size={24} color="#fff" />
+              </TouchableOpacity>
+              <Ionicons name="text-outline" size={18} color="#fff" />
+              <TouchableOpacity style={styles.controlButton} onPress={() => adjustFontSize(4)}>
+                <Ionicons name="add-circle-outline" size={24} color="#fff" />
+              </TouchableOpacity>
+            </View>
+
+            <View style={styles.stepperContainer}>
               <TouchableOpacity style={styles.controlButton} onPress={() => adjustMargin(-2)}>
                 <Ionicons name="remove-circle-outline" size={24} color="#fff" />
               </TouchableOpacity>
-              <Ionicons name="resize-outline" size={18} color="#fff" />
+              <MaterialCommunityIcons name="arrow-expand-horizontal" size={20} color="#fff" />
               <TouchableOpacity style={styles.controlButton} onPress={() => adjustMargin(2)}>
                 <Ionicons name="add-circle-outline" size={24} color="#fff" />
               </TouchableOpacity>
@@ -442,16 +450,22 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
+    flexWrap: "wrap",
     paddingHorizontal: 16,
     paddingVertical: 8,
     backgroundColor: "rgba(0, 0, 0, 0.8)",
     borderBottomWidth: 1,
     borderBottomColor: "#222",
+    gap: 12,
   },
-  centerControls: {
+  controlGroup: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 16,
+    gap: 12,
+  },
+  stepperContainer: {
+    flexDirection: "row",
+    alignItems: "center",
   },
   controlButton: {
     alignItems: "center",
