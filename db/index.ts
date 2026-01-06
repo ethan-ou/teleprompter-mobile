@@ -14,4 +14,8 @@ expo.execSync(`
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS settings (
+    name TEXT PRIMARY KEY NOT NULL,
+    value TEXT NOT NULL
+  );
 `);

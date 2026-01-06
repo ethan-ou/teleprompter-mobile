@@ -7,3 +7,8 @@ export const scripts = sqliteTable("scripts", {
   createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
   updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
 });
+
+export const settings = sqliteTable("settings", {
+  name: text("name").primaryKey(),
+  value: text("value").notNull(),
+});

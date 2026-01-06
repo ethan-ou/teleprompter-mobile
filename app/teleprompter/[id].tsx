@@ -1,5 +1,5 @@
 import { db } from "@/db";
-import { scripts } from "@/db/schema";
+import { scripts, settings } from "@/db/schema";
 import { TeleprompterRecognizer, type Position } from "@/lib/recognizer";
 import { getBoundsStart, resetTranscriptWindow } from "@/lib/speech-matcher";
 import { getNextWordIndex, tokenize, type Token } from "@/lib/word-tokenizer";
@@ -37,6 +37,32 @@ export default function Teleprompter() {
       .where(eq(scripts.id, Number(id)))
   );
 
+  const { data: settingsData } = useLiveQuery(db.select().from(settings));
+
+  useEffect(() => {
+    if (settingsData) {
+      settingsData.forEach((setting) => {
+        switch (setting.name) {
+          case "fontSize":
+            setFontSize(Number(setting.value));
+            break;
+          case "margin":
+            setMargin(Number(setting.value));
+            break;
+          case "mirror":
+            setMirror(setting.value === "true");
+            break;
+          case "orientation":
+            setOrientationMode(setting.value as any);
+            break;
+          case "align":
+            setAlign(setting.value as any);
+            break;
+        }
+      });
+    }
+  }, [settingsData]);
+
   useEffect(() => {
     if (scriptData) {
       if (scriptData.length > 0) {
@@ -53,7 +79,7 @@ export default function Teleprompter() {
   const [orientationMode, setOrientationMode] = useState<"portrait" | "landscape" | "system">(
     "landscape"
   );
-  const [isMirrored, setIsMirrored] = useState(false);
+  const [mirror, setMirror] = useState(false);
   const [fontSize, setFontSize] = useState(32);
   const [margin, setMargin] = useState(10);
   const [align, setAlign] = useState<"top" | "center" | "bottom">("center");
@@ -214,12 +240,28 @@ export default function Teleprompter() {
     resetTranscriptWindow();
   };
 
+  const updateSetting = async (name: string, value: string | number | boolean) => {
+    const val = String(value);
+    await db
+      .insert(settings)
+      .values({ name, value: val })
+      .onConflictDoUpdate({ target: settings.name, set: { value: val } });
+  };
+
   const adjustFontSize = (delta: number) => {
-    setFontSize((prev) => Math.max(16, Math.min(72, prev + delta)));
+    setFontSize((prev) => {
+      const newVal = Math.max(16, Math.min(72, prev + delta));
+      updateSetting("fontSize", newVal);
+      return newVal;
+    });
   };
 
   const adjustMargin = (delta: number) => {
-    setMargin((prev) => Math.max(0, Math.min(40, prev + delta)));
+    setMargin((prev) => {
+      const newVal = Math.max(0, Math.min(40, prev + delta));
+      updateSetting("margin", newVal);
+      return newVal;
+    });
   };
 
   if (!script) {
@@ -264,14 +306,16 @@ export default function Teleprompter() {
             </TouchableOpacity>
           </View>
 
-          {/* Group 2: Alignment, Orientation, Mirror */}
+          {/* Group 2: Align, Orientation, Mirror */}
           <View style={styles.controlGroup}>
             <TouchableOpacity
               style={styles.controlButton}
               onPress={() => {
                 const alignments: ("top" | "center" | "bottom")[] = ["top", "center", "bottom"];
                 const currentIndex = alignments.indexOf(align);
-                setAlign(alignments[(currentIndex + 1) % alignments.length]);
+                const nextAlign = alignments[(currentIndex + 1) % alignments.length];
+                setAlign(nextAlign);
+                updateSetting("align", nextAlign);
               }}
             >
               <Ionicons
@@ -293,7 +337,9 @@ export default function Teleprompter() {
                   "system",
                 ];
                 const currentIndex = modes.indexOf(orientationMode);
-                setOrientationMode(modes[(currentIndex + 1) % modes.length]);
+                const nextMode = modes[(currentIndex + 1) % modes.length];
+                setOrientationMode(nextMode);
+                updateSetting("orientation", nextMode);
               }}
             >
               <Ionicons
@@ -311,8 +357,12 @@ export default function Teleprompter() {
             </TouchableOpacity>
 
             <TouchableOpacity
-              style={[styles.controlButton, isMirrored && styles.controlButtonActive]}
-              onPress={() => setIsMirrored(!isMirrored)}
+              style={[styles.controlButton, mirror && styles.controlButtonActive]}
+              onPress={() => {
+                const nextVal = !mirror;
+                setMirror(nextVal);
+                updateSetting("mirror", nextVal);
+              }}
             >
               <Ionicons name="swap-horizontal-outline" size={24} color="#fff" />
               <Text style={styles.controlLabel}>Mirror</Text>
@@ -364,7 +414,7 @@ export default function Teleprompter() {
       {/* Script Content */}
       <ScrollView
         ref={scrollViewRef}
-        style={[styles.scrollView, isMirrored && { transform: [{ scaleX: -1 }] }]}
+        style={[styles.scrollView, mirror && { transform: [{ scaleX: -1 }] }]}
         contentContainerStyle={[
           styles.scrollContent,
           {
