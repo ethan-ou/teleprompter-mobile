@@ -123,6 +123,7 @@ export class TeleprompterRecognizer {
       });
 
       this.speechRecognizer.onend(() => {
+        this.speechRecognizer = null;
         this.callbacks.onEnd?.();
         resetTranscriptWindow();
       });

@@ -9,7 +9,7 @@ import { useLiveQuery } from "drizzle-orm/expo-sqlite";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import * as ScreenOrientation from "expo-screen-orientation";
 import { StatusBar } from "expo-status-bar";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   Dimensions,
@@ -29,16 +29,38 @@ export default function Teleprompter() {
   const recognizerRef = useRef<TeleprompterRecognizer | null>(null);
   const tokenRefs = useRef<Map<number, View>>(new Map());
 
-  const [script, setScript] = useState<any>(null);
+  // 1. Script & Settings Data
   const { data: scriptData } = useLiveQuery(
     db
       .select()
       .from(scripts)
       .where(eq(scripts.id, Number(id)))
   );
+  const script = scriptData?.[0] ?? null;
 
   const { data: settingsData } = useLiveQuery(db.select().from(settings));
 
+  // 2. State
+  const [isPlaying, setIsPlaying] = useState(false);
+  const isPlayingRef = useRef(isPlaying);
+  isPlayingRef.current = isPlaying;
+
+  const [isMenuVisible, setIsMenuVisible] = useState(true);
+  const [orientationMode, setOrientationMode] = useState<"portrait" | "landscape" | "system">(
+    "landscape"
+  );
+  const [mirror, setMirror] = useState(false);
+  const [fontSize, setFontSize] = useState(32);
+  const [margin, setMargin] = useState(10);
+  const [align, setAlign] = useState<"top" | "center" | "bottom">("center");
+  const [position, setPosition] = useState<Position>({
+    start: -1,
+    search: -1,
+    end: -1,
+    bounds: -1,
+  });
+
+  // Hydrate settings from DB
   useEffect(() => {
     if (settingsData) {
       settingsData.forEach((setting) => {
@@ -63,37 +85,45 @@ export default function Teleprompter() {
     }
   }, [settingsData]);
 
+  // 3. Memoize Tokens
+  const tokens = useMemo(() => {
+    if (!script?.content) return [];
+    tokenRefs.current.clear();
+    return tokenize(script.content);
+  }, [script?.content]);
+
+  // 4. Update Recognizer when tokens change
   useEffect(() => {
-    if (scriptData) {
-      if (scriptData.length > 0) {
-        setScript(scriptData[0]);
-      } else {
-        Alert.alert("Error", "Script not found");
-        router.back();
-      }
+    if (tokens.length === 0) return;
+
+    if (recognizerRef.current) {
+      recognizerRef.current.updateTokens(tokens);
+    } else {
+      recognizerRef.current = new TeleprompterRecognizer(tokens, {
+        onPositionUpdate: setPosition,
+        onError: (error) => {
+          console.error("Speech recognition error:", error);
+          Alert.alert("Voice Recognition Error", error.message || "An error occurred");
+          setIsPlaying(false);
+        },
+        onEnd: () => {
+          setIsPlaying(false);
+        },
+      });
     }
-  }, [scriptData, router]);
 
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [isMenuVisible, setIsMenuVisible] = useState(true);
-  const [orientationMode, setOrientationMode] = useState<"portrait" | "landscape" | "system">(
-    "landscape"
-  );
-  const [mirror, setMirror] = useState(false);
-  const [fontSize, setFontSize] = useState(32);
-  const [margin, setMargin] = useState(10);
-  const [align, setAlign] = useState<"top" | "center" | "bottom">("center");
-  const [tokens, setTokens] = useState<Token[]>([]);
-  const [position, setPosition] = useState<Position>({
-    start: -1,
-    search: -1,
-    end: -1,
-    bounds: -1,
-  });
+    // Clamp position to new token count to prevent out-of-bounds issues
+    setPosition((prev) => ({
+      start: Math.min(prev.start, tokens.length - 1),
+      search: Math.min(prev.search, tokens.length - 1),
+      end: Math.min(prev.end, tokens.length - 1),
+      bounds: Math.min(prev.bounds, tokens.length - 1),
+    }));
+  }, [tokens]);
 
+  // 5. Global Cleanup
   useEffect(() => {
     return () => {
-      // Cleanup
       if (recognizerRef.current?.isRunning()) {
         recognizerRef.current.stop();
       }
@@ -103,9 +133,9 @@ export default function Teleprompter() {
         console.warn("Could not unlock orientation:", err)
       );
     };
-  }, [id]);
+  }, []);
 
-  // Handle orientation changes
+  // 6. Handle orientation changes
   useEffect(() => {
     const applyOrientation = async () => {
       try {
@@ -124,7 +154,7 @@ export default function Teleprompter() {
     applyOrientation();
   }, [orientationMode]);
 
-  // Auto-scroll to highlighted word in voice mode
+  // 7. Auto-scroll to highlighted word in voice mode
   useEffect(() => {
     if (isPlaying && position.end >= 0) {
       const nextWordIndex = getNextWordIndex(tokens, position.end);
@@ -134,6 +164,9 @@ export default function Teleprompter() {
         tokenRef.measureLayout(
           scrollViewRef.current as any,
           (x, y) => {
+            // Only scroll if we are still playing
+            if (!isPlayingRef.current) return;
+
             const screenHeight = Dimensions.get("window").height;
 
             // Calculate target position based on alignment
@@ -157,42 +190,6 @@ export default function Teleprompter() {
       }
     }
   }, [position.end, isPlaying, tokens, align]);
-
-  // Tokenize script content
-  useEffect(() => {
-    if (script?.content) {
-      const newTokens = tokenize(script.content);
-      tokenRefs.current.clear();
-      setTokens(newTokens);
-
-      // Initialize recognizer
-      if (recognizerRef.current) {
-        recognizerRef.current.updateTokens(newTokens);
-      } else {
-        recognizerRef.current = new TeleprompterRecognizer(newTokens, {
-          onPositionUpdate: (newPosition) => {
-            setPosition(newPosition);
-          },
-          onError: (error) => {
-            console.error("Speech recognition error:", error);
-            Alert.alert("Voice Recognition Error", error.message || "An error occurred");
-            setIsPlaying(false);
-          },
-          onEnd: () => {
-            setIsPlaying(false);
-          },
-        });
-      }
-
-      // Clamp position to new token count to prevent out-of-bounds issues
-      setPosition((prev) => ({
-        start: Math.min(prev.start, newTokens.length - 1),
-        search: Math.min(prev.search, newTokens.length - 1),
-        end: Math.min(prev.end, newTokens.length - 1),
-        bounds: Math.min(prev.bounds, newTokens.length - 1),
-      }));
-    }
-  }, [script?.content]);
 
   const togglePlayPause = useCallback(async () => {
     if (isPlaying) {
@@ -532,8 +529,8 @@ const styles = StyleSheet.create({
     marginTop: 1,
   },
   playButton: {
-    width: 44,
-    height: 44,
+    width: 40,
+    height: 40,
     borderRadius: 22,
     backgroundColor: "#007AFF",
     alignItems: "center",
@@ -567,7 +564,6 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_400Regular",
     // For some reason adding padding stops text from being cut off
     paddingHorizontal: 0.0001,
-    backgroundColor: "transparent",
   },
   highlightedToken: {
     color: "#FFD700",
@@ -583,20 +579,11 @@ const styles = StyleSheet.create({
     height: 10,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "transparent",
   },
   handleBar: {
     width: 100,
     height: 5,
     borderRadius: 1.5,
     backgroundColor: "rgba(255, 255, 255, 0.5)",
-  },
-  guideLine: {
-    position: "absolute",
-    left: 0,
-    right: 0,
-    height: 3,
-    backgroundColor: "#FF3B30",
-    opacity: 0.5,
   },
 });
