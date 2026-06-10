@@ -5,6 +5,25 @@ Working docs for two tracks of work agreed 2026-06.
 - [`voice-asr-plan.md`](./voice-asr-plan.md) — replace the Android speech backend with a low-latency, on-device streaming model. Benchmark-first, **far-field focused**.
 - [`ux-plan.md`](./ux-plan.md) — UX first pass: dark mode app-wide, control-bar redesign, scroll-to-reposition, keep-awake/haptics, intro-screen usability.
 
+## Build & run (Android, on-device STT)
+
+The on-device model (~131 MB) is **not in git**. To build from scratch:
+
+```bash
+bash scripts/fetch-model.sh            # downloads + bundles the FastConformer model into Android assets
+cd android && ./gradlew assembleDebug  # JDK is pinned to JBR 21 via android/gradle.properties
+```
+
+To install + run the already-built debug APK on a connected device:
+
+```bash
+adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+npx expo start                         # Metro must be running; phone on the same network
+```
+
+The teleprompter defaults to the on-device engine (`SherpaASREngine`) and falls back to the Google
+recognizer if the model can't load. It needs a custom dev build — it won't run in Expo Go.
+
 ## Context
 
 The app is an Expo / React Native teleprompter. Its strength is `lib/speech-matcher.ts`, which fuzzy-aligns the live transcript to the known script (Levenshtein sliding window + moving-average smoothing) and auto-scrolls. Because the ground-truth script is known, **streaming latency matters far more than transcript WER** — the matcher tolerates a sloppy transcript but not lag.
