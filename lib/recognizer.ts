@@ -6,6 +6,8 @@ import type { Token } from "./word-tokenizer";
 export type { Position } from "./match-engine";
 
 export type RecognizerCallbacks = {
+  /** Engine prepared (permissions granted, model loaded) — safe to start. */
+  onReady?: () => void;
   onStart?: () => void;
   onPositionUpdate?: (position: Position) => void;
   onEnd?: () => void;
@@ -23,6 +25,10 @@ export class TeleprompterRecognizer {
     bounds: -1,
   };
   private callbacks: RecognizerCallbacks = {};
+
+  private prepared = false;
+  private preparing = false;
+  private running = false;
 
   constructor(tokens: Token[], callbacks: RecognizerCallbacks = {}, engineId: ASREngineId = "expo") {
     this.tokens = tokens;
@@ -43,52 +49,79 @@ export class TeleprompterRecognizer {
     return this.position;
   }
 
-  async start(): Promise<void> {
-    if (this.speechRecognizer !== null) {
-      return;
-    }
+  /** Create the engine once and wire its events. The engine is kept warm and
+   *  reused across start/stop so a preloaded model isn't thrown away. */
+  private ensureEngine(): ASREngine {
+    if (this.speechRecognizer) return this.speechRecognizer;
 
-    try {
-      this.speechRecognizer = createASREngine(this.engineId);
+    const engine = createASREngine(this.engineId);
 
-      this.speechRecognizer.onstart(() => {
-        if (this.position.bounds < 0) {
-          const bounds = getBoundsStart(this.tokens, 0);
-          if (bounds !== undefined) {
-            this.updatePosition({ bounds });
-          }
+    engine.onstart(() => {
+      if (this.position.bounds < 0) {
+        const bounds = getBoundsStart(this.tokens, 0);
+        if (bounds !== undefined) {
+          this.updatePosition({ bounds });
         }
-        this.callbacks.onStart?.();
-      });
+      }
+      this.callbacks.onStart?.();
+    });
 
-      this.speechRecognizer.onresult((finalTranscript: string, interimTranscript: string) => {
-        const next = stepPosition(this.tokens, this.position, finalTranscript, interimTranscript);
-        this.updatePosition(next);
-      });
+    engine.onresult((finalTranscript: string, interimTranscript: string) => {
+      const next = stepPosition(this.tokens, this.position, finalTranscript, interimTranscript);
+      this.updatePosition(next);
+    });
 
-      this.speechRecognizer.onerror((error) => {
-        this.callbacks.onError?.(error);
-      });
+    engine.onerror((error) => {
+      this.callbacks.onError?.(error);
+    });
 
-      this.speechRecognizer.onend(() => {
-        this.speechRecognizer = null;
-        this.callbacks.onEnd?.();
-        resetTranscriptWindow();
-      });
+    engine.onend(() => {
+      this.running = false;
+      this.callbacks.onEnd?.();
+      resetTranscriptWindow();
+    });
 
-      await this.speechRecognizer.start();
+    this.speechRecognizer = engine;
+    return engine;
+  }
+
+  /** Warm up the engine ahead of time (request permissions, load the on-device
+   *  model). Call this on screen entry so `start()` is near-instant. Safe to
+   *  call multiple times. */
+  async prepare(): Promise<void> {
+    if (this.prepared || this.preparing) return;
+    this.preparing = true;
+    try {
+      const engine = this.ensureEngine();
+      await engine.prepare?.();
+      this.prepared = true;
+      this.callbacks.onReady?.();
     } catch (error) {
+      this.callbacks.onError?.(error);
+    } finally {
+      this.preparing = false;
+    }
+  }
+
+  isReady(): boolean {
+    return this.prepared;
+  }
+
+  async start(): Promise<void> {
+    const engine = this.ensureEngine();
+    try {
+      this.running = true;
+      await engine.start();
+    } catch (error) {
+      this.running = false;
       this.callbacks.onError?.(error);
       throw error;
     }
   }
 
   stop(): void {
-    if (this.speechRecognizer !== null) {
-      this.speechRecognizer.stop();
-      this.speechRecognizer.cleanup();
-      this.speechRecognizer = null;
-    }
+    this.running = false;
+    this.speechRecognizer?.stop();
     resetTranscriptWindow();
   }
 
@@ -103,6 +136,18 @@ export class TeleprompterRecognizer {
   }
 
   isRunning(): boolean {
-    return this.speechRecognizer !== null;
+    return this.running;
+  }
+
+  /** Fully tear down the engine and free any loaded model. Call on unmount. */
+  dispose(): void {
+    this.running = false;
+    this.prepared = false;
+    if (this.speechRecognizer) {
+      this.speechRecognizer.stop();
+      this.speechRecognizer.cleanup();
+      this.speechRecognizer = null;
+    }
+    resetTranscriptWindow();
   }
 }

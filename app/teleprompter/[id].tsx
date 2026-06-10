@@ -15,7 +15,6 @@ import { StatusBar } from "expo-status-bar";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
-  Animated,
   ScrollView,
   StyleSheet,
   Text,
@@ -60,7 +59,11 @@ export default function Teleprompter() {
   const isPlayingRef = useRef(isPlaying);
   isPlayingRef.current = isPlaying;
 
-  const [countdown, setCountdown] = useState<number | null>(null);
+  // Engine warmed up on screen entry (permissions granted / model loaded).
+  const [isReady, setIsReady] = useState(false);
+  // True between tapping play and recognition actually going live.
+  const [isStarting, setIsStarting] = useState(false);
+
   const [isMenuVisible, setIsMenuVisible] = useState(true);
   const [orientationMode, setOrientationMode] = useState<"portrait" | "landscape" | "system">(
     "landscape"
@@ -81,9 +84,6 @@ export default function Teleprompter() {
   const userDraggingRef = useRef(false);
   const repositionTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lineYRef = useRef<Map<number, number>>(new Map());
-
-  // Listening-indicator pulse
-  const pulse = useRef(new Animated.Value(1)).current;
 
   // Hydrate settings from DB
   useEffect(() => {
@@ -141,16 +141,27 @@ export default function Teleprompter() {
       recognizerRef.current.updateTokens(tokens);
     } else {
       recognizerRef.current = new TeleprompterRecognizer(tokens, {
+        onReady: () => setIsReady(true),
+        onStart: () => {
+          // Recognition is actually live now.
+          setIsStarting(false);
+          setIsPlaying(true);
+        },
         onPositionUpdate: setPosition,
         onError: (error) => {
           console.error("Speech recognition error:", error);
           Alert.alert("Voice Recognition Error", error.message || "An error occurred");
+          setIsStarting(false);
           setIsPlaying(false);
         },
         onEnd: () => {
+          setIsStarting(false);
           setIsPlaying(false);
         },
       });
+      // Warm up the engine now so play is instant (and the mic prompt happens
+      // on entry, not on first tap).
+      recognizerRef.current.prepare();
     }
 
     setPosition((prev) => ({
@@ -164,9 +175,8 @@ export default function Teleprompter() {
   // 5. Global Cleanup
   useEffect(() => {
     return () => {
-      if (recognizerRef.current?.isRunning()) {
-        recognizerRef.current.stop();
-      }
+      // Tear down the engine and free any loaded model on leave.
+      recognizerRef.current?.dispose();
       deactivateKeepAwake(KEEP_AWAKE_TAG).catch(() => {});
       ScreenOrientation.unlockAsync().catch((err) =>
         console.warn("Could not unlock orientation:", err)
@@ -183,23 +193,7 @@ export default function Teleprompter() {
     }
   }, [isPlaying]);
 
-  // 7. Listening-indicator pulse animation
-  useEffect(() => {
-    if (!isPlaying) {
-      pulse.setValue(1);
-      return;
-    }
-    const anim = Animated.loop(
-      Animated.sequence([
-        Animated.timing(pulse, { toValue: 0.25, duration: 700, useNativeDriver: true }),
-        Animated.timing(pulse, { toValue: 1, duration: 700, useNativeDriver: true }),
-      ])
-    );
-    anim.start();
-    return () => anim.stop();
-  }, [isPlaying, pulse]);
-
-  // 8. Handle orientation changes
+  // 7. Handle orientation changes
   useEffect(() => {
     const applyOrientation = async () => {
       try {
@@ -291,12 +285,15 @@ export default function Teleprompter() {
   };
 
   const startListening = useCallback(async () => {
+    if (!recognizerRef.current?.isReady()) return; // not warmed up yet
+    setIsStarting(true);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
     try {
+      // isPlaying flips on the engine's onStart event (see recognizer callbacks).
       await recognizerRef.current?.start();
-      setIsPlaying(true);
-      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
     } catch (error) {
       console.error("Failed to start voice recognition:", error);
+      setIsStarting(false);
       Alert.alert(
         "Voice Recognition Error",
         "Failed to start voice recognition. Please check microphone permissions."
@@ -304,41 +301,21 @@ export default function Teleprompter() {
     }
   }, []);
 
-  // Countdown ticker -> start listening at 0
-  useEffect(() => {
-    if (countdown === null) return;
-    if (countdown === 0) {
-      setCountdown(null);
-      startListening();
-      return;
-    }
-    const t = setTimeout(() => {
-      Haptics.selectionAsync().catch(() => {});
-      setCountdown((c) => (c === null ? null : c - 1));
-    }, 800);
-    return () => clearTimeout(t);
-  }, [countdown, startListening]);
-
   const togglePlayPause = useCallback(() => {
+    if (!isReady || isStarting) return; // not warmed up, or already starting
     if (isPlaying) {
       recognizerRef.current?.stop();
       setIsPlaying(false);
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
       return;
     }
-    if (countdown !== null) {
-      setCountdown(null); // tapping again during countdown cancels it
-      return;
-    }
-    Haptics.selectionAsync().catch(() => {});
-    setCountdown(3);
-  }, [isPlaying, countdown]);
+    startListening();
+  }, [isPlaying, isReady, isStarting, startListening]);
 
   const resetScroll = () => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
     scrollViewRef.current?.scrollTo({ y: 0, animated: true });
     setIsPlaying(false);
-    setCountdown(null);
 
     const newPosition: Position = { start: -1, search: -1, end: -1, bounds: -1 };
     setPosition(newPosition);
@@ -404,11 +381,8 @@ export default function Teleprompter() {
   };
 
   if (!script) {
-    return (
-      <View style={[styles.container, styles.center]}>
-        <Text style={styles.loadingText}>Loading…</Text>
-      </View>
-    );
+    // Brief DB fetch — show the black background, not a "Loading…" flash.
+    return <View style={styles.container} />;
   }
 
   return (
@@ -425,28 +399,22 @@ export default function Teleprompter() {
             </TouchableOpacity>
 
             <TouchableOpacity
-              style={[styles.playButton, isPlaying && styles.playButtonActive]}
+              style={[
+                styles.playButton,
+                isPlaying && styles.playButtonActive,
+                (!isReady || isStarting) && styles.playButtonDisabled,
+              ]}
               onPress={togglePlayPause}
               activeOpacity={0.85}
+              disabled={!isReady || isStarting}
             >
-              <Ionicons
-                name={isPlaying ? "pause" : countdown !== null ? "ellipsis-horizontal" : "play"}
-                size={26}
-                color="#fff"
-              />
+              <Ionicons name={isPlaying ? "pause" : "play"} size={26} color="#fff" />
             </TouchableOpacity>
 
-            {isPlaying ? (
-              <View style={styles.listeningPill}>
-                <Animated.View style={[styles.listeningDot, { opacity: pulse }]} />
-                <Text style={styles.listeningText}>Listening</Text>
-              </View>
-            ) : (
-              <TouchableOpacity style={styles.labelBtn} onPress={resetScroll} hitSlop={6}>
-                <Ionicons name="refresh" size={22} color={colors.text} />
-                <Text style={styles.btnLabel}>Reset</Text>
-              </TouchableOpacity>
-            )}
+            <TouchableOpacity style={styles.labelBtn} onPress={resetScroll} hitSlop={6}>
+              <Ionicons name="refresh" size={22} color={colors.text} />
+              <Text style={styles.btnLabel}>Reset</Text>
+            </TouchableOpacity>
 
             <TouchableOpacity
               style={styles.labelBtn}
@@ -555,18 +523,6 @@ export default function Teleprompter() {
         <View style={styles.handleBar} />
       </TouchableOpacity>
 
-      {/* Reading-line indicator (only while presenting) */}
-      {isPlaying && (
-        <View
-          pointerEvents="none"
-          style={[styles.readingLine, { top: windowHeight * ALIGN_FRACTION[align] }]}
-        >
-          <Ionicons name="caret-forward" size={16} color={colors.accent} />
-          <View style={styles.readingLineBar} />
-          <Ionicons name="caret-back" size={16} color={colors.accent} />
-        </View>
-      )}
-
       {/* Script Content */}
       <ScrollView
         ref={scrollViewRef}
@@ -635,18 +591,6 @@ export default function Teleprompter() {
           </View>
         </View>
       </ScrollView>
-
-      {/* Countdown overlay */}
-      {countdown !== null && countdown > 0 && (
-        <TouchableOpacity
-          style={styles.countdownOverlay}
-          activeOpacity={1}
-          onPress={() => setCountdown(null)}
-        >
-          <Text style={styles.countdownNumber}>{countdown}</Text>
-          <Text style={styles.countdownHint}>Get ready… tap to cancel</Text>
-        </TouchableOpacity>
-      )}
     </View>
   );
 }
@@ -655,14 +599,6 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: colors.background,
-  },
-  center: {
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  loadingText: {
-    color: colors.textMuted,
-    fontFamily: "Inter_400Regular",
   },
   controlBar: {
     flexDirection: "row",
@@ -724,25 +660,8 @@ const styles = StyleSheet.create({
   playButtonActive: {
     backgroundColor: colors.danger,
   },
-  listeningPill: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
-    paddingHorizontal: 10,
-    height: 32,
-    borderRadius: 16,
-    backgroundColor: "rgba(255,69,58,0.15)",
-  },
-  listeningDot: {
-    width: 9,
-    height: 9,
-    borderRadius: 5,
-    backgroundColor: colors.danger,
-  },
-  listeningText: {
-    color: colors.danger,
-    fontSize: 12,
-    fontFamily: "Inter_600SemiBold",
+  playButtonDisabled: {
+    backgroundColor: colors.surfaceElevated,
   },
   stepper: {
     flexDirection: "row",
@@ -782,23 +701,6 @@ const styles = StyleSheet.create({
     borderRadius: 2.5,
     backgroundColor: "rgba(255,255,255,0.4)",
   },
-  readingLine: {
-    position: "absolute",
-    left: 0,
-    right: 0,
-    height: 0,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    paddingHorizontal: 8,
-    zIndex: 50,
-  },
-  readingLineBar: {
-    flex: 1,
-    height: 2,
-    marginHorizontal: 4,
-    backgroundColor: "rgba(10,132,255,0.35)",
-  },
   scrollView: {
     flex: 1,
   },
@@ -834,23 +736,5 @@ const styles = StyleSheet.create({
   },
   pastToken: {
     color: colors.textFaint,
-  },
-  countdownOverlay: {
-    ...StyleSheet.absoluteFillObject,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: "rgba(0,0,0,0.75)",
-    zIndex: 200,
-  },
-  countdownNumber: {
-    color: colors.text,
-    fontSize: 120,
-    fontFamily: "Inter_700Bold",
-  },
-  countdownHint: {
-    color: colors.textMuted,
-    fontSize: 15,
-    fontFamily: "Inter_500Medium",
-    marginTop: 8,
   },
 });

@@ -136,17 +136,23 @@ export class ExpoASREngine extends ASREmitter implements ASREngine {
     }
   }
 
-  async start(): Promise<void> {
+  // Warm-up for this engine is just permissions + listener binding; the Android
+  // speech service has no separate model to preload.
+  async prepare(): Promise<void> {
     const result = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
     if (!result.granted) {
       Alert.alert(
         "Permission Required",
         "Microphone permission is required for speech recognition."
       );
-      return;
+      throw new Error("Microphone permission not granted");
     }
-
     this.bindListeners();
+  }
+
+  async start(): Promise<void> {
+    await this.prepare();
+
     this.running = true;
     this.startedAt = Date.now();
     this.previousRestarts = [];

@@ -19,6 +19,10 @@ export type ASRError = {
 };
 
 export interface ASREngine {
+  /** Optional warm-up: request permissions and load any on-device model so a
+   *  later start() is near-instant. Throw if it can't be made ready (e.g. mic
+   *  permission denied). Engines without setup cost may omit this. */
+  prepare?(): Promise<void>;
   /** Begin recognition. Should request mic permission if needed. */
   start(): Promise<void>;
   /** Stop recognition. Idempotent. */
