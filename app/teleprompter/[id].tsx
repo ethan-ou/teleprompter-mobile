@@ -14,6 +14,7 @@ import * as ScreenOrientation from "expo-screen-orientation";
 import { StatusBar } from "expo-status-bar";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ActivityIndicator,
   Alert,
   type LayoutChangeEvent,
   type NativeSyntheticEvent,
@@ -483,7 +484,12 @@ export default function Teleprompter() {
               activeOpacity={0.85}
               disabled={!isReady || isStarting}
             >
-              <Ionicons name={isPlaying ? "pause" : "play"} size={26} color="#fff" />
+              {isReady ? (
+                <Ionicons name={isPlaying ? "pause" : "play"} size={26} color="#fff" />
+              ) : (
+                // Model still warming up — show a spinner so it reads as "loading", not "broken".
+                <ActivityIndicator size="small" color="#fff" />
+              )}
             </TouchableOpacity>
 
             <TouchableOpacity style={styles.labelBtn} onPress={resetScroll} hitSlop={6}>
