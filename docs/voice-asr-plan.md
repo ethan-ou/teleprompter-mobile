@@ -141,9 +141,19 @@ lib/asr/
   index.ts          # factory: pick engine by id, fall back to expo when unavailable
 ```
 
-**Phase 1 — implement `SherpaASREngine`.**
+**Phase 1 — implement `SherpaASREngine` (DONE).** Integrated `react-native-sherpa-onnx` (+
+`@dr.pogodin/react-native-fs`). Model: **NeMo streaming FastConformer transducer en 480ms int8**
+(~131 MB), bundled at `android/app/src/main/assets/models/fast-conformer-en-480ms` via
+`scripts/fetch-model.sh` (model kept out of git). `SherpaASREngine` loads the model in `prepare()`,
+captures mic via `createPcmLiveStream`, feeds chunks to the streaming recognizer, and emits
+interim/final on the matcher contract. `TeleprompterRecognizer` defaults to `"sherpa"` and falls back
+to `ExpoASREngine` if the model can't load. Android needs no manual native setup (autolinks). Build:
+`scripts/fetch-model.sh` then `cd android && ./gradlew assembleDebug` (JBR 21 via `org.gradle.java.home`).
+NOT yet verified with live voice on-device — see §6.
+
+Original recipe (for reference):
 1. `npx expo install react-native-sherpa-onnx`, add its Expo config plugin, rebuild dev client.
-2. Bundle the GigaSpeech model under `assets/models/streaming-zipformer-en`.
+2. Bundle the model under `assets/models/...`.
 3. Wire the streaming session (concrete recipe):
    ```ts
    const engine = await createStreamingSTT({
@@ -188,6 +198,12 @@ settings, keep `ExpoASREngine` as fallback where the native model isn't present.
 
 ## 6. Open questions / risks
 
+- **UNVERIFIED: live voice on-device.** The integration builds and the engine is wired, but voice
+  tracking/highlighting was never exercised with a real mic (phone disconnected during the build).
+  First on-device run needs a sanity check: does the model load, does the cursor track, is latency OK?
+  If the model fails to load, the recognizer silently falls back to the Google engine.
+- **Chunk backpressure:** `SherpaASREngine` serializes PCM chunks through a promise chain; if decode
+  can't keep up with real time the chain grows. Watch for growing lag; if seen, batch/drop frames.
 - **Capture chain (mostly answered):** the lib's `createPcmLiveStream` resamples to 16 kHz and
   `enableInputNormalization` handles varying mic levels. Still verify the Android audio *source* it
   opens — ideally `VOICE_RECOGNITION` so platform AEC/NS/AGC engage; may need a small native tweak.
