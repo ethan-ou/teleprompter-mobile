@@ -57,6 +57,11 @@ export class SherpaASREngine extends ASREmitter implements ASREngine {
       modelType: "auto",
       enableEndpoint: true,
       enableInputNormalization: true,
+      // The encoder dominates decode time; let it use the phone's big cores so a
+      // chunk decodes well inside its 100ms arrival window and never backs up the
+      // serial chain (the thing that would otherwise grow tracking latency).
+      numThreads: 4,
+      decodingMethod: "greedy_search", // fastest; the matcher tolerates a sloppy transcript
       endpointConfig: {
         // Speech-then-silence ends an utterance. Trailing silence kept modest so
         // low-energy far-field words aren't clipped.
@@ -80,17 +85,19 @@ export class SherpaASREngine extends ASREmitter implements ASREngine {
       this.emitError({ code: "audio", message });
     });
 
-    // Serialize chunk processing so native calls don't overlap.
+    // Serialize chunk processing so native calls don't overlap. Pass the
+    // Float32Array straight through: the lib hands us a freshly-allocated buffer
+    // per chunk (no reuse to guard against) and converts to a bridge array itself,
+    // so an Array.from() here would just be a redundant second boxing on the hot path.
     this.unsubData = pcm.onData((samples, sr) => {
-      const frame = Array.from(samples);
-      this.chain = this.chain.then(() => this.processFrame(frame, sr));
+      this.chain = this.chain.then(() => this.processFrame(samples, sr));
     });
 
     await pcm.start();
     this.emitStart();
   }
 
-  private async processFrame(samples: number[], sampleRate: number): Promise<void> {
+  private async processFrame(samples: Float32Array, sampleRate: number): Promise<void> {
     const stream = this.stream;
     if (!stream) return;
     try {
