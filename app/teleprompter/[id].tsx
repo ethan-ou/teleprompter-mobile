@@ -234,21 +234,35 @@ export default function Teleprompter() {
     return () => {
       // Tear down the engine and free any loaded model on leave.
       recognizerRef.current?.dispose();
-      deactivateKeepAwake(KEEP_AWAKE_TAG).catch(() => {});
       ScreenOrientation.unlockAsync().catch((err) =>
         console.warn("Could not unlock orientation:", err)
       );
     };
   }, []);
 
-  // 6. Keep the screen awake only while presenting
+  // 6. Keep the screen awake for the whole presenting session.
+  //    Expo rejects activate() with "Unable to activate keep awake" when the
+  //    Activity is momentarily unavailable (the screen/orientation transition as
+  //    we enter), and on that failure the wake lock never engages — so the screen
+  //    could sleep mid-presentation. Retry through that window and swallow the
+  //    error in a try/catch so it can't surface as an unhandled rejection in dev.
   useEffect(() => {
-    if (isPlaying) {
-      activateKeepAwakeAsync(KEEP_AWAKE_TAG).catch(() => {});
-    } else {
+    let cancelled = false;
+    const enable = async (attempt = 0) => {
+      try {
+        await activateKeepAwakeAsync(KEEP_AWAKE_TAG);
+      } catch {
+        if (!cancelled && attempt < 4) {
+          setTimeout(() => enable(attempt + 1), 200);
+        }
+      }
+    };
+    enable();
+    return () => {
+      cancelled = true;
       deactivateKeepAwake(KEEP_AWAKE_TAG).catch(() => {});
-    }
-  }, [isPlaying]);
+    };
+  }, []);
 
   // 7. Handle orientation changes
   useEffect(() => {
