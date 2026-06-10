@@ -1,7 +1,7 @@
 import { db } from "@/db";
 import { scripts, settings } from "@/db/schema";
 import { TeleprompterRecognizer, type Position } from "@/lib/recognizer";
-import { getBoundsStart, resetTranscriptWindow } from "@/lib/speech-matcher";
+import { getBoundsStart, getTokensFromText, resetTranscriptWindow } from "@/lib/speech-matcher";
 import { colors } from "@/lib/theme";
 import { getNextWordIndex, tokenize, type Token } from "@/lib/word-tokenizer";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
@@ -15,9 +15,12 @@ import { StatusBar } from "expo-status-bar";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
+  type LayoutChangeEvent,
+  type NativeSyntheticEvent,
   ScrollView,
   StyleSheet,
   Text,
+  type TextLayoutEventData,
   TouchableOpacity,
   useWindowDimensions,
   View,
@@ -25,7 +28,12 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 const KEEP_AWAKE_TAG = "teleprompter";
-const SCROLL_TOP_PADDING = 80; // keep in sync with styles.scrollContent.paddingTop
+
+// Reconstruct a run of source text from its tokens (delimiters carry the spacing).
+const joinTokens = (toks: Token[]) => toks.map((t) => t.value).join("");
+
+// Geometry of one visual (wrapped) line within a paragraph.
+type VisualLine = { y: number; words: number };
 
 // Where the "reading line" sits as a fraction of screen height, per alignment.
 const ALIGN_FRACTION: Record<"top" | "center" | "bottom", number> = {
@@ -41,7 +49,11 @@ export default function Teleprompter() {
   const { height: windowHeight } = useWindowDimensions();
   const scrollViewRef = useRef<ScrollView>(null);
   const recognizerRef = useRef<TeleprompterRecognizer | null>(null);
-  const tokenRefs = useRef<Map<number, View>>(new Map());
+  // Text geometry, computed by the native text engine (no per-word views):
+  //   paraYRef    — paragraph top Y (relative to the content), from onLayout
+  //   paraLinesRef — per-paragraph wrapped-line geometry, from onTextLayout
+  const paraYRef = useRef<Map<number, number>>(new Map());
+  const paraLinesRef = useRef<Map<number, VisualLine[]>>(new Map());
 
   // 1. Script & Settings Data
   const { data: scriptData } = useLiveQuery(
@@ -56,8 +68,6 @@ export default function Teleprompter() {
 
   // 2. State
   const [isPlaying, setIsPlaying] = useState(false);
-  const isPlayingRef = useRef(isPlaying);
-  isPlayingRef.current = isPlaying;
 
   // Engine warmed up on screen entry (permissions granted / model loaded).
   const [isReady, setIsReady] = useState(false);
@@ -79,11 +89,15 @@ export default function Teleprompter() {
     bounds: -1,
   });
 
+  // Screen-space position of the reading line, and the content top-padding that
+  // lets the very first line scroll down to it (and the bottom-padding so the last
+  // line can too). Geometry below is measured relative to this padded top.
+  const readingOffset = windowHeight * ALIGN_FRACTION[align];
+
   // Scroll-to-reposition bookkeeping
   const scrollYRef = useRef(0);
   const userDraggingRef = useRef(false);
   const repositionTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lineYRef = useRef<Map<number, number>>(new Map());
 
   // Hydrate settings from DB
   useEffect(() => {
@@ -113,7 +127,8 @@ export default function Teleprompter() {
   // 3. Memoize Tokens + line structure (line -> first token index for repositioning)
   const tokens = useMemo(() => {
     if (!script?.content) return [];
-    tokenRefs.current.clear();
+    paraYRef.current.clear();
+    paraLinesRef.current.clear();
     return tokenize(script.content);
   }, [script?.content]);
 
@@ -132,6 +147,42 @@ export default function Teleprompter() {
     flush();
     return out;
   }, [tokens]);
+
+  // token index -> paragraph index
+  const paragraphOfToken = useMemo(() => {
+    const map = new Map<number, number>();
+    lines.forEach((line, p) => line.tokens.forEach((t) => map.set(t.index, p)));
+    return map;
+  }, [lines]);
+
+  // paragraph index -> its word (TOKEN) indices in order. Used to map a word to
+  // its wrapped line (word counts from onTextLayout) for scrolling.
+  const paragraphWords = useMemo(
+    () => lines.map((line) => line.tokens.filter((t) => t.type === "TOKEN").map((t) => t.index)),
+    [lines]
+  );
+
+  // Absolute content Y of the wrapped line containing a given word token.
+  const tokenLineY = useCallback(
+    (tokenIndex: number): number | undefined => {
+      const p = paragraphOfToken.get(tokenIndex);
+      if (p === undefined) return undefined;
+      const paraY = paraYRef.current.get(p);
+      const visualLines = paraLinesRef.current.get(p);
+      const words = paragraphWords[p];
+      if (paraY === undefined || !visualLines || !words) return undefined;
+      const ordinal = words.indexOf(tokenIndex);
+      if (ordinal < 0) return undefined;
+      let counted = 0;
+      for (const vl of visualLines) {
+        if (ordinal < counted + vl.words) return readingOffset + paraY + vl.y;
+        counted += vl.words;
+      }
+      const last = visualLines[visualLines.length - 1];
+      return readingOffset + paraY + (last ? last.y : 0);
+    },
+    [paragraphOfToken, paragraphWords, readingOffset]
+  );
 
   // 4. Update Recognizer when tokens change
   useEffect(() => {
@@ -212,55 +263,59 @@ export default function Teleprompter() {
     applyOrientation();
   }, [orientationMode]);
 
-  // 9. Auto-scroll to highlighted word in voice mode (suppressed while the user drags)
+  // 9. Auto-scroll to the wrapped line with the current word (suppressed while dragging).
   useEffect(() => {
     if (!isPlaying || position.end < 0 || userDraggingRef.current) return;
 
     const nextWordIndex = getNextWordIndex(tokens, position.end);
-    const tokenRef = tokenRefs.current.get(nextWordIndex);
-    if (!tokenRef) return;
+    const lineY = tokenLineY(nextWordIndex);
+    if (lineY === undefined) return;
 
-    tokenRef.measureLayout(
-      scrollViewRef.current as any,
-      (x, y) => {
-        if (!isPlayingRef.current || userDraggingRef.current) return;
-        const targetY = y - windowHeight * ALIGN_FRACTION[align];
-        scrollViewRef.current?.scrollTo({ y: Math.max(0, targetY), animated: true });
-      },
-      () => {}
-    );
-  }, [position.end, isPlaying, tokens, align, windowHeight]);
+    const targetY = lineY - readingOffset;
+    scrollViewRef.current?.scrollTo({ y: Math.max(0, targetY), animated: true });
+  }, [position.end, isPlaying, tokens, readingOffset, tokenLineY]);
 
-  // Re-anchor the matcher to whatever line is now at the reading line after a manual scroll.
+  // Re-anchor the matcher to the wrapped line now at the reading line after a manual scroll.
   const repositionToReadingLine = useCallback(() => {
-    const readingLineY = scrollYRef.current + windowHeight * ALIGN_FRACTION[align];
+    const readingLineY = scrollYRef.current + readingOffset;
 
-    let bestLine: number | null = null;
+    let bestFirstToken: number | null = null;
     let bestY = -Infinity;
-    lineYRef.current.forEach((y, lineIndex) => {
-      const absY = y + SCROLL_TOP_PADDING;
-      if (absY <= readingLineY && absY > bestY) {
-        bestY = absY;
-        bestLine = lineIndex;
+    paraLinesRef.current.forEach((visualLines, p) => {
+      const paraY = paraYRef.current.get(p);
+      const words = paragraphWords[p];
+      if (paraY === undefined || !words) return;
+      let counted = 0;
+      for (const vl of visualLines) {
+        const absY = readingOffset + paraY + vl.y;
+        const firstToken = words[counted]; // first word on this wrapped line
+        if (vl.words > 0 && firstToken !== undefined && absY <= readingLineY && absY > bestY) {
+          bestY = absY;
+          bestFirstToken = firstToken;
+        }
+        counted += vl.words;
       }
     });
 
-    if (bestLine === null) return;
-    const firstTokenIndex = lines[bestLine]?.firstTokenIndex;
-    if (firstTokenIndex == null) return;
+    if (bestFirstToken === null) return;
 
-    const bounds = getBoundsStart(tokens, firstTokenIndex);
+    // Two overlapping states: the search anchor (where matching resumes) and the
+    // read boundary (start/end, what gets dimmed). Anchor at the target word, but
+    // set the read boundary to JUST BEFORE it so the target word is the next to
+    // read — not pre-dimmed/"selected".
+    const readBoundary = bestFirstToken - 1;
+    const bounds = getBoundsStart(tokens, bestFirstToken);
     const newPosition: Position = {
-      start: firstTokenIndex,
-      search: firstTokenIndex,
-      end: firstTokenIndex,
+      start: readBoundary,
+      search: bestFirstToken,
+      end: readBoundary,
       bounds: bounds ?? -1,
     };
     setPosition(newPosition);
     recognizerRef.current?.updatePosition(newPosition);
     resetTranscriptWindow();
     Haptics.selectionAsync().catch(() => {});
-  }, [align, windowHeight, lines, tokens]);
+  }, [readingOffset, paragraphWords, tokens]);
 
   const handleScrollBeginDrag = () => {
     userDraggingRef.current = true;
@@ -528,8 +583,10 @@ export default function Teleprompter() {
         ref={scrollViewRef}
         style={[styles.scrollView, mirror && { transform: [{ scaleX: -1 }] }]}
         contentContainerStyle={[
-          styles.scrollContent,
           {
+            // Top/bottom padding so the first and last lines can reach the reading line.
+            paddingTop: readingOffset,
+            paddingBottom: windowHeight - readingOffset + 80,
             paddingLeft: `${margin}%`,
             paddingRight: `${margin * 0.8 - Math.min(fontSize / 80, 1) * 0.4}%`,
           },
@@ -545,49 +602,61 @@ export default function Teleprompter() {
       >
         <View style={styles.scriptContainer}>
           <View style={styles.tokenWrapper}>
-            {lines.map((line, lineIndex) => (
-              <View
-                key={lineIndex}
-                onLayout={(e) => {
-                  lineYRef.current.set(lineIndex, e.nativeEvent.layout.y);
-                }}
-                style={{
-                  flexDirection: "row",
-                  flexWrap: "wrap",
-                  width: "100%",
-                  minHeight: line.tokens.length === 0 ? fontSize + 10 : 0,
-                }}
-              >
-                {line.tokens.map((token) => {
-                  const isHighlighted =
-                    isPlaying && token.index <= position.end && token.index > position.start;
-                  const isCurrent = isPlaying && token.index === position.end;
-                  const isPast = isPlaying && token.index <= position.start;
+            {lines.map((line, p) => {
+              const setParaY = (e: LayoutChangeEvent) =>
+                paraYRef.current.set(p, e.nativeEvent.layout.y);
+              const setParaLines = (e: NativeSyntheticEvent<TextLayoutEventData>) =>
+                paraLinesRef.current.set(
+                  p,
+                  e.nativeEvent.lines.map((l) => ({ y: l.y, words: getTokensFromText(l.text).length }))
+                );
 
-                  return (
-                    <View
-                      key={token.index}
-                      ref={(ref) => {
-                        if (ref) tokenRefs.current.set(token.index, ref);
-                      }}
-                      style={styles.tokenContainer}
-                    >
-                      <Text
-                        style={[
-                          styles.scriptText,
-                          { fontSize, lineHeight: fontSize + 10 },
-                          isPast && styles.pastToken,
-                          isHighlighted && styles.highlightedToken,
-                          isCurrent && styles.currentToken,
-                        ]}
-                      >
-                        {token.value}
-                      </Text>
-                    </View>
-                  );
-                })}
-              </View>
-            ))}
+              // Blank line (paragraph break) — a spacer that still records its Y.
+              if (line.tokens.length === 0) {
+                return <View key={p} onLayout={setParaY} style={{ height: fontSize + 10 }} />;
+              }
+
+              const lineStyle = [styles.scriptText, { fontSize, lineHeight: fontSize + 10 }];
+              const firstTok = line.tokens[0].index;
+              const lastTok = line.tokens[line.tokens.length - 1].index;
+
+              // Dim-past / bright-ahead: everything already spoken — including words
+              // matched in the live partial (index <= end) — is dimmed; only upcoming
+              // text stays bright. The grey→white boundary is the position cue.
+              const straddles =
+                isPlaying && firstTok <= position.end && lastTok > position.end;
+
+              // Whole paragraph one colour (cheap single string) unless it straddles
+              // the read boundary.
+              if (!straddles) {
+                const fullyPast = isPlaying && lastTok <= position.end;
+                return (
+                  <Text
+                    key={p}
+                    onLayout={setParaY}
+                    onTextLayout={setParaLines}
+                    style={[...lineStyle, fullyPast && styles.pastToken]}
+                  >
+                    {joinTokens(line.tokens)}
+                  </Text>
+                );
+              }
+
+              // Straddling paragraph: a dim run (spoken) + a bright run (upcoming).
+              const past: Token[] = [];
+              const ahead: Token[] = [];
+              for (const t of line.tokens) {
+                if (t.index <= position.end) past.push(t);
+                else ahead.push(t);
+              }
+
+              return (
+                <Text key={p} onLayout={setParaY} onTextLayout={setParaLines} style={lineStyle}>
+                  {past.length > 0 && <Text style={styles.pastToken}>{joinTokens(past)}</Text>}
+                  {ahead.length > 0 && <Text>{joinTokens(ahead)}</Text>}
+                </Text>
+              );
+            })}
           </View>
         </View>
       </ScrollView>
@@ -704,27 +773,18 @@ const styles = StyleSheet.create({
   scrollView: {
     flex: 1,
   },
-  scrollContent: {
-    paddingTop: SCROLL_TOP_PADDING,
-    paddingBottom: 200,
-  },
   scriptContainer: {
     alignItems: "flex-start",
+    width: "100%",
   },
   tokenWrapper: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    justifyContent: "flex-start",
-  },
-  tokenContainer: {
-    flexDirection: "row",
+    width: "100%",
   },
   scriptText: {
+    width: "100%",
     color: colors.text,
     textAlign: "left",
     fontFamily: "Inter_400Regular",
-    // For some reason adding padding stops text from being cut off
-    paddingHorizontal: 0.0001,
   },
   highlightedToken: {
     color: colors.highlight,

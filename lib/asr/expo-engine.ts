@@ -67,15 +67,13 @@ export class ExpoASREngine extends ASREmitter implements ASREngine {
       "error",
       (event: ExpoSpeechRecognitionErrorEvent) => {
         switch (event.error) {
-          case "network":
-            // Network dropouts are usually not an issue!
-            break;
           case "audio-capture":
             this.stop();
             Alert.alert(
               "Error",
               "No microphone found. Check your microphone settings and try again."
             );
+            this.emitError({ code: event.error, message: event.message });
             break;
           case "not-allowed":
           case "service-not-allowed":
@@ -84,10 +82,14 @@ export class ExpoASREngine extends ASREmitter implements ASREngine {
               "Permission Denied",
               "Permission to use microphone has been denied. Check your microphone settings and try again."
             );
+            this.emitError({ code: event.error, message: event.message });
+            break;
+          default:
+            // Expected/transient during a session: no-speech, speech-timeout,
+            // no-match, aborted (on stop), network dropouts. Swallow them — the
+            // recognizer auto-restarts on "end", so don't alert or stop playback.
             break;
         }
-
-        this.emitError({ code: event.error, message: event.message });
       }
     );
 
