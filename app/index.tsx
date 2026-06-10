@@ -1,12 +1,29 @@
 import { db } from "@/db";
 import { scripts } from "@/db/schema";
+import { colors } from "@/lib/theme";
 import { Ionicons } from "@expo/vector-icons";
 import { inArray } from "drizzle-orm";
 import { useLiveQuery } from "drizzle-orm/expo-sqlite";
 import { useRouter } from "expo-router";
+import { StatusBar } from "expo-status-bar";
 import { useState } from "react";
 import { Alert, FlatList, StyleSheet, Text, TouchableOpacity, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+
+// Average reading pace used for the duration estimate.
+const WORDS_PER_MINUTE = 130;
+
+function wordCount(text: string): number {
+  const trimmed = text.trim();
+  return trimmed ? trimmed.split(/\s+/).length : 0;
+}
+
+function readingTime(words: number): string {
+  if (words === 0) return "Empty";
+  const minutes = words / WORDS_PER_MINUTE;
+  if (minutes < 1) return `${words} words · <1 min`;
+  return `${words} words · ${Math.round(minutes)} min`;
+}
 
 export default function Index() {
   const router = useRouter();
@@ -29,7 +46,8 @@ export default function Index() {
         setSelectedIds([...selectedIds, id]);
       }
     } else {
-      router.push(`/edit/${id}`);
+      // Tapping a script presents it — the obvious primary action.
+      router.push(`/teleprompter/${id}`);
     }
   };
 
@@ -68,22 +86,24 @@ export default function Index() {
 
   return (
     <View style={styles.container}>
+      <StatusBar style="light" />
       <View style={[styles.header, { paddingTop: insets.top + 16 }]}>
         {selectionMode ? (
           <>
-            <TouchableOpacity onPress={cancelSelection}>
+            <TouchableOpacity onPress={cancelSelection} hitSlop={8}>
               <Text style={styles.cancelText}>Cancel</Text>
             </TouchableOpacity>
             <Text style={styles.title}>{selectedIds.length} selected</Text>
             <TouchableOpacity
-              style={[styles.deleteButton, selectedIds.length === 0 && styles.deleteButtonDisabled]}
+              style={[styles.iconButton, selectedIds.length === 0 && styles.disabled]}
               onPress={deleteSelected}
               disabled={selectedIds.length === 0}
+              hitSlop={8}
             >
               <Ionicons
                 name="trash-outline"
                 size={24}
-                color={selectedIds.length > 0 ? "#FF3B30" : "#ccc"}
+                color={selectedIds.length > 0 ? colors.danger : colors.textFaint}
               />
             </TouchableOpacity>
           </>
@@ -91,10 +111,11 @@ export default function Index() {
           <>
             <Text style={styles.title}>Scripts</Text>
             <TouchableOpacity
-              style={styles.menuButton}
+              style={styles.iconButton}
               onPress={() => setMenuVisible(!menuVisible)}
+              hitSlop={8}
             >
-              <Ionicons name="ellipsis-vertical" size={24} color="#000" />
+              <Ionicons name="ellipsis-vertical" size={24} color={colors.text} />
             </TouchableOpacity>
           </>
         )}
@@ -102,80 +123,108 @@ export default function Index() {
 
       {/* Dropdown Menu */}
       {menuVisible && !selectionMode && (
-        <View style={styles.menuContainer}>
+        <>
           <TouchableOpacity
-            style={styles.menuItem}
-            onPress={() => {
-              setMenuVisible(false);
-              router.push("/edit");
-            }}
-          >
-            <Ionicons name="add-outline" size={20} color="#000" />
-            <Text style={styles.menuItemText}>New Script</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={styles.menuItem}
-            onPress={() => {
-              setMenuVisible(false);
-              setSelectionMode(true);
-            }}
-          >
-            <Ionicons name="trash-outline" size={20} color="#000" />
-            <Text style={styles.menuItemText}>Delete Scripts</Text>
-          </TouchableOpacity>
-        </View>
+            style={styles.menuBackdrop}
+            activeOpacity={1}
+            onPress={() => setMenuVisible(false)}
+          />
+          <View style={styles.menuContainer}>
+            <TouchableOpacity
+              style={styles.menuItem}
+              onPress={() => {
+                setMenuVisible(false);
+                router.push("/edit");
+              }}
+            >
+              <Ionicons name="add-outline" size={20} color={colors.text} />
+              <Text style={styles.menuItemText}>New Script</Text>
+            </TouchableOpacity>
+            <View style={styles.menuDivider} />
+            <TouchableOpacity
+              style={styles.menuItem}
+              onPress={() => {
+                setMenuVisible(false);
+                setSelectionMode(true);
+              }}
+            >
+              <Ionicons name="trash-outline" size={20} color={colors.text} />
+              <Text style={styles.menuItemText}>Select & Delete</Text>
+            </TouchableOpacity>
+          </View>
+        </>
       )}
 
       <FlatList
         data={scriptList || []}
         keyExtractor={(item) => item.id.toString()}
         contentContainerStyle={styles.listContent}
-        renderItem={({ item }) => (
-          <TouchableOpacity
-            style={styles.scriptItem}
-            onPress={() => handlePress(item.id)}
-            onLongPress={() => handleLongPress(item.id)}
-          >
-            {selectionMode && (
-              <View style={styles.checkboxContainer}>
-                <Ionicons
-                  name={selectedIds.includes(item.id) ? "checkbox" : "square-outline"}
-                  size={28}
-                  color={selectedIds.includes(item.id) ? "#007AFF" : "#ccc"}
-                />
+        renderItem={({ item }) => {
+          const selected = selectedIds.includes(item.id);
+          return (
+            <TouchableOpacity
+              style={[styles.scriptItem, selected && styles.scriptItemSelected]}
+              onPress={() => handlePress(item.id)}
+              onLongPress={() => handleLongPress(item.id)}
+              activeOpacity={0.7}
+            >
+              {selectionMode && (
+                <View style={styles.checkboxContainer}>
+                  <Ionicons
+                    name={selected ? "checkmark-circle" : "ellipse-outline"}
+                    size={26}
+                    color={selected ? colors.accent : colors.textFaint}
+                  />
+                </View>
+              )}
+              <View style={styles.scriptInfo}>
+                <Text style={styles.scriptTitle} numberOfLines={1}>
+                  {item.title}
+                </Text>
+                <Text style={styles.scriptMeta}>{readingTime(wordCount(item.content))}</Text>
+                <Text style={styles.scriptPreview} numberOfLines={2}>
+                  {item.content}
+                </Text>
               </View>
-            )}
-            <View style={styles.scriptInfo}>
-              <Text style={styles.scriptTitle}>{item.title}</Text>
-              <Text style={styles.scriptPreview} numberOfLines={2}>
-                {item.content}
-              </Text>
-            </View>
-            {!selectionMode && (
-              <TouchableOpacity
-                style={styles.playButton}
-                onPress={(e) => {
-                  e.stopPropagation();
-                  router.push(`/teleprompter/${item.id}`);
-                }}
-              >
-                <Ionicons name="play-circle" size={32} color="#007AFF" />
-              </TouchableOpacity>
-            )}
-          </TouchableOpacity>
-        )}
+              {!selectionMode && (
+                <View style={styles.scriptActions}>
+                  <TouchableOpacity
+                    style={styles.actionButton}
+                    onPress={(e) => {
+                      e.stopPropagation();
+                      router.push(`/edit/${item.id}`);
+                    }}
+                    hitSlop={8}
+                  >
+                    <Ionicons name="create-outline" size={22} color={colors.textMuted} />
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.actionButton}
+                    onPress={(e) => {
+                      e.stopPropagation();
+                      router.push(`/teleprompter/${item.id}`);
+                    }}
+                    hitSlop={8}
+                  >
+                    <Ionicons name="play-circle" size={36} color={colors.accent} />
+                  </TouchableOpacity>
+                </View>
+              )}
+            </TouchableOpacity>
+          );
+        }}
         ListEmptyComponent={
           <View style={styles.emptyContainer}>
-            <Ionicons name="document-text-outline" size={64} color="#ccc" />
+            <Ionicons name="document-text-outline" size={64} color={colors.textFaint} />
             <Text style={styles.emptyText}>No scripts yet</Text>
-            <Text style={styles.emptySubtext}>Tap the + button to create one</Text>
+            <Text style={styles.emptySubtext}>Tap + to create your first script</Text>
           </View>
         }
       />
 
       {/* Floating Action Button */}
       {!selectionMode && (
-        <TouchableOpacity style={styles.fab} onPress={() => router.push("/edit")}>
+        <TouchableOpacity style={styles.fab} onPress={() => router.push("/edit")} activeOpacity={0.8}>
           <Ionicons name="add" size={32} color="#fff" />
         </TouchableOpacity>
       )}
@@ -186,88 +235,92 @@ export default function Index() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: "#f5f5f5",
+    backgroundColor: colors.background,
   },
   header: {
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
-    padding: 16,
-    backgroundColor: "#fff",
-    borderBottomWidth: 1,
-    borderBottomColor: "#e0e0e0",
+    paddingHorizontal: 16,
+    paddingBottom: 16,
+    backgroundColor: colors.background,
   },
   title: {
-    fontSize: 28,
+    fontSize: 30,
     fontFamily: "Inter_700Bold",
+    color: colors.text,
   },
-  menuButton: {
+  iconButton: {
     padding: 8,
+  },
+  disabled: {
+    opacity: 0.4,
+  },
+  menuBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 999,
   },
   menuContainer: {
     position: "absolute",
-    top: 100,
+    top: 96,
     right: 16,
-    backgroundColor: "#fff",
-    borderRadius: 8,
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.25,
-    shadowRadius: 4,
-    elevation: 5,
-    minWidth: 160,
+    backgroundColor: colors.surfaceElevated,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: colors.border,
+    minWidth: 190,
     zIndex: 1000,
+    overflow: "hidden",
   },
   menuItem: {
     flexDirection: "row",
     alignItems: "center",
-    padding: 16,
+    paddingVertical: 14,
+    paddingHorizontal: 16,
     gap: 12,
   },
   menuItemText: {
     fontSize: 16,
-    color: "#000",
+    color: colors.text,
+    fontFamily: "Inter_500Medium",
+  },
+  menuDivider: {
+    height: 1,
+    backgroundColor: colors.border,
   },
   fab: {
     position: "absolute",
-    bottom: 24,
+    bottom: 32,
     right: 24,
-    backgroundColor: "#007AFF",
-    width: 56,
-    height: 56,
-    borderRadius: 28,
+    backgroundColor: colors.accent,
+    width: 60,
+    height: 60,
+    borderRadius: 30,
     justifyContent: "center",
     alignItems: "center",
     shadowColor: "#000",
     shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 6,
+    shadowOpacity: 0.4,
+    shadowRadius: 8,
     elevation: 8,
-  },
-  addButton: {
-    backgroundColor: "#007AFF",
-    width: 44,
-    height: 44,
-    borderRadius: 22,
-    justifyContent: "center",
-    alignItems: "center",
   },
   listContent: {
     padding: 16,
+    paddingBottom: 120,
   },
   scriptItem: {
-    backgroundColor: "#fff",
-    borderRadius: 12,
+    backgroundColor: colors.surface,
+    borderRadius: 14,
     padding: 16,
     marginBottom: 12,
     flexDirection: "row",
-    justifyContent: "space-between",
     alignItems: "center",
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 4,
-    elevation: 3,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  scriptItemSelected: {
+    borderColor: colors.accent,
+    backgroundColor: colors.surfaceElevated,
   },
   scriptInfo: {
     flex: 1,
@@ -276,46 +329,52 @@ const styles = StyleSheet.create({
   scriptTitle: {
     fontSize: 18,
     fontFamily: "Inter_600SemiBold",
-    marginBottom: 8,
+    color: colors.text,
+    marginBottom: 4,
+  },
+  scriptMeta: {
+    fontSize: 12,
+    fontFamily: "Inter_500Medium",
+    color: colors.accent,
+    marginBottom: 6,
   },
   scriptPreview: {
     fontSize: 14,
     fontFamily: "Inter_400Regular",
-    color: "#666",
+    color: colors.textMuted,
     lineHeight: 20,
   },
-  playButton: {
-    padding: 8,
+  scriptActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+  },
+  actionButton: {
+    padding: 4,
   },
   checkboxContainer: {
-    marginRight: 12,
+    marginRight: 14,
   },
   cancelText: {
     fontSize: 17,
-    color: "#007AFF",
+    color: colors.accent,
     fontFamily: "Inter_600SemiBold",
-  },
-  deleteButton: {
-    padding: 8,
-  },
-  deleteButtonDisabled: {
-    opacity: 0.5,
   },
   emptyContainer: {
     alignItems: "center",
     justifyContent: "center",
-    paddingTop: 80,
+    paddingTop: 100,
   },
   emptyText: {
     fontSize: 20,
     fontFamily: "Inter_600SemiBold",
-    color: "#999",
+    color: colors.textMuted,
     marginTop: 16,
   },
   emptySubtext: {
-    fontSize: 16,
+    fontSize: 15,
     fontFamily: "Inter_400Regular",
-    color: "#ccc",
+    color: colors.textFaint,
     marginTop: 8,
   },
 });

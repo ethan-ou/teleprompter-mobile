@@ -2,29 +2,44 @@ import { db } from "@/db";
 import { scripts, settings } from "@/db/schema";
 import { TeleprompterRecognizer, type Position } from "@/lib/recognizer";
 import { getBoundsStart, resetTranscriptWindow } from "@/lib/speech-matcher";
+import { colors } from "@/lib/theme";
 import { getNextWordIndex, tokenize, type Token } from "@/lib/word-tokenizer";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { eq } from "drizzle-orm";
 import { useLiveQuery } from "drizzle-orm/expo-sqlite";
+import * as Haptics from "expo-haptics";
+import { activateKeepAwakeAsync, deactivateKeepAwake } from "expo-keep-awake";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import * as ScreenOrientation from "expo-screen-orientation";
 import { StatusBar } from "expo-status-bar";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
-  Dimensions,
+  Animated,
   ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+
+const KEEP_AWAKE_TAG = "teleprompter";
+const SCROLL_TOP_PADDING = 80; // keep in sync with styles.scrollContent.paddingTop
+
+// Where the "reading line" sits as a fraction of screen height, per alignment.
+const ALIGN_FRACTION: Record<"top" | "center" | "bottom", number> = {
+  top: 0.1,
+  center: 0.4,
+  bottom: 0.75,
+};
 
 export default function Teleprompter() {
   const { id } = useLocalSearchParams();
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  const { height: windowHeight } = useWindowDimensions();
   const scrollViewRef = useRef<ScrollView>(null);
   const recognizerRef = useRef<TeleprompterRecognizer | null>(null);
   const tokenRefs = useRef<Map<number, View>>(new Map());
@@ -45,6 +60,7 @@ export default function Teleprompter() {
   const isPlayingRef = useRef(isPlaying);
   isPlayingRef.current = isPlaying;
 
+  const [countdown, setCountdown] = useState<number | null>(null);
   const [isMenuVisible, setIsMenuVisible] = useState(true);
   const [orientationMode, setOrientationMode] = useState<"portrait" | "landscape" | "system">(
     "landscape"
@@ -59,6 +75,15 @@ export default function Teleprompter() {
     end: -1,
     bounds: -1,
   });
+
+  // Scroll-to-reposition bookkeeping
+  const scrollYRef = useRef(0);
+  const userDraggingRef = useRef(false);
+  const repositionTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lineYRef = useRef<Map<number, number>>(new Map());
+
+  // Listening-indicator pulse
+  const pulse = useRef(new Animated.Value(1)).current;
 
   // Hydrate settings from DB
   useEffect(() => {
@@ -85,12 +110,28 @@ export default function Teleprompter() {
     }
   }, [settingsData]);
 
-  // 3. Memoize Tokens
+  // 3. Memoize Tokens + line structure (line -> first token index for repositioning)
   const tokens = useMemo(() => {
     if (!script?.content) return [];
     tokenRefs.current.clear();
     return tokenize(script.content);
   }, [script?.content]);
+
+  const lines = useMemo(() => {
+    const out: { tokens: Token[]; firstTokenIndex: number | null }[] = [];
+    let current: Token[] = [];
+    const flush = () => {
+      const firstToken = current.find((t) => t.type === "TOKEN") ?? current[0];
+      out.push({ tokens: current, firstTokenIndex: firstToken ? firstToken.index : null });
+      current = [];
+    };
+    tokens.forEach((token) => {
+      if (token.value === "\n") flush();
+      else current.push(token);
+    });
+    flush();
+    return out;
+  }, [tokens]);
 
   // 4. Update Recognizer when tokens change
   useEffect(() => {
@@ -112,7 +153,6 @@ export default function Teleprompter() {
       });
     }
 
-    // Clamp position to new token count to prevent out-of-bounds issues
     setPosition((prev) => ({
       start: Math.min(prev.start, tokens.length - 1),
       search: Math.min(prev.search, tokens.length - 1),
@@ -127,15 +167,39 @@ export default function Teleprompter() {
       if (recognizerRef.current?.isRunning()) {
         recognizerRef.current.stop();
       }
-
-      // Unlock orientation when leaving
+      deactivateKeepAwake(KEEP_AWAKE_TAG).catch(() => {});
       ScreenOrientation.unlockAsync().catch((err) =>
         console.warn("Could not unlock orientation:", err)
       );
     };
   }, []);
 
-  // 6. Handle orientation changes
+  // 6. Keep the screen awake only while presenting
+  useEffect(() => {
+    if (isPlaying) {
+      activateKeepAwakeAsync(KEEP_AWAKE_TAG).catch(() => {});
+    } else {
+      deactivateKeepAwake(KEEP_AWAKE_TAG).catch(() => {});
+    }
+  }, [isPlaying]);
+
+  // 7. Listening-indicator pulse animation
+  useEffect(() => {
+    if (!isPlaying) {
+      pulse.setValue(1);
+      return;
+    }
+    const anim = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulse, { toValue: 0.25, duration: 700, useNativeDriver: true }),
+        Animated.timing(pulse, { toValue: 1, duration: 700, useNativeDriver: true }),
+      ])
+    );
+    anim.start();
+    return () => anim.stop();
+  }, [isPlaying, pulse]);
+
+  // 8. Handle orientation changes
   useEffect(() => {
     const applyOrientation = async () => {
       try {
@@ -154,74 +218,129 @@ export default function Teleprompter() {
     applyOrientation();
   }, [orientationMode]);
 
-  // 7. Auto-scroll to highlighted word in voice mode
+  // 9. Auto-scroll to highlighted word in voice mode (suppressed while the user drags)
   useEffect(() => {
-    if (isPlaying && position.end >= 0) {
-      const nextWordIndex = getNextWordIndex(tokens, position.end);
-      const tokenRef = tokenRefs.current.get(nextWordIndex);
+    if (!isPlaying || position.end < 0 || userDraggingRef.current) return;
 
-      if (tokenRef) {
-        tokenRef.measureLayout(
-          scrollViewRef.current as any,
-          (x, y) => {
-            // Only scroll if we are still playing
-            if (!isPlayingRef.current) return;
+    const nextWordIndex = getNextWordIndex(tokens, position.end);
+    const tokenRef = tokenRefs.current.get(nextWordIndex);
+    if (!tokenRef) return;
 
-            const screenHeight = Dimensions.get("window").height;
+    tokenRef.measureLayout(
+      scrollViewRef.current as any,
+      (x, y) => {
+        if (!isPlayingRef.current || userDraggingRef.current) return;
+        const targetY = y - windowHeight * ALIGN_FRACTION[align];
+        scrollViewRef.current?.scrollTo({ y: Math.max(0, targetY), animated: true });
+      },
+      () => {}
+    );
+  }, [position.end, isPlaying, tokens, align, windowHeight]);
 
-            // Calculate target position based on alignment
-            const alignmentOffsets = {
-              top: screenHeight * 0.1,
-              center: screenHeight * 0.4,
-              bottom: screenHeight * 0.75,
-            };
+  // Re-anchor the matcher to whatever line is now at the reading line after a manual scroll.
+  const repositionToReadingLine = useCallback(() => {
+    const readingLineY = scrollYRef.current + windowHeight * ALIGN_FRACTION[align];
 
-            const targetY = y - alignmentOffsets[align];
-
-            scrollViewRef.current?.scrollTo({
-              y: Math.max(0, targetY),
-              animated: true,
-            });
-          },
-          () => {
-            // Measurement failed, ignore
-          }
-        );
+    let bestLine: number | null = null;
+    let bestY = -Infinity;
+    lineYRef.current.forEach((y, lineIndex) => {
+      const absY = y + SCROLL_TOP_PADDING;
+      if (absY <= readingLineY && absY > bestY) {
+        bestY = absY;
+        bestLine = lineIndex;
       }
-    }
-  }, [position.end, isPlaying, tokens, align]);
+    });
 
-  const togglePlayPause = useCallback(async () => {
+    if (bestLine === null) return;
+    const firstTokenIndex = lines[bestLine]?.firstTokenIndex;
+    if (firstTokenIndex == null) return;
+
+    const bounds = getBoundsStart(tokens, firstTokenIndex);
+    const newPosition: Position = {
+      start: firstTokenIndex,
+      search: firstTokenIndex,
+      end: firstTokenIndex,
+      bounds: bounds ?? -1,
+    };
+    setPosition(newPosition);
+    recognizerRef.current?.updatePosition(newPosition);
+    resetTranscriptWindow();
+    Haptics.selectionAsync().catch(() => {});
+  }, [align, windowHeight, lines, tokens]);
+
+  const handleScrollBeginDrag = () => {
+    userDraggingRef.current = true;
+    if (repositionTimer.current) clearTimeout(repositionTimer.current);
+  };
+
+  const finishUserScroll = () => {
+    if (!userDraggingRef.current) return;
+    userDraggingRef.current = false;
+    repositionToReadingLine();
+  };
+
+  const handleScrollEndDrag = () => {
+    // Fallback when the gesture ends with no momentum (onMomentumScrollEnd won't fire).
+    if (repositionTimer.current) clearTimeout(repositionTimer.current);
+    repositionTimer.current = setTimeout(finishUserScroll, 120);
+  };
+
+  const handleMomentumScrollEnd = () => {
+    if (repositionTimer.current) clearTimeout(repositionTimer.current);
+    finishUserScroll();
+  };
+
+  const startListening = useCallback(async () => {
+    try {
+      await recognizerRef.current?.start();
+      setIsPlaying(true);
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
+    } catch (error) {
+      console.error("Failed to start voice recognition:", error);
+      Alert.alert(
+        "Voice Recognition Error",
+        "Failed to start voice recognition. Please check microphone permissions."
+      );
+    }
+  }, []);
+
+  // Countdown ticker -> start listening at 0
+  useEffect(() => {
+    if (countdown === null) return;
+    if (countdown === 0) {
+      setCountdown(null);
+      startListening();
+      return;
+    }
+    const t = setTimeout(() => {
+      Haptics.selectionAsync().catch(() => {});
+      setCountdown((c) => (c === null ? null : c - 1));
+    }, 800);
+    return () => clearTimeout(t);
+  }, [countdown, startListening]);
+
+  const togglePlayPause = useCallback(() => {
     if (isPlaying) {
-      // Stop voice recognition
       recognizerRef.current?.stop();
       setIsPlaying(false);
-    } else {
-      // Start voice recognition
-      try {
-        await recognizerRef.current?.start();
-        setIsPlaying(true);
-      } catch (error) {
-        console.error("Failed to start voice recognition:", error);
-        Alert.alert(
-          "Voice Recognition Error",
-          "Failed to start voice recognition. Please check microphone permissions."
-        );
-      }
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+      return;
     }
-  }, [isPlaying]);
+    if (countdown !== null) {
+      setCountdown(null); // tapping again during countdown cancels it
+      return;
+    }
+    Haptics.selectionAsync().catch(() => {});
+    setCountdown(3);
+  }, [isPlaying, countdown]);
 
   const resetScroll = () => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
     scrollViewRef.current?.scrollTo({ y: 0, animated: true });
     setIsPlaying(false);
+    setCountdown(null);
 
-    // Reset position
-    const newPosition: Position = {
-      start: -1,
-      search: -1,
-      end: -1,
-      bounds: -1,
-    };
+    const newPosition: Position = { start: -1, search: -1, end: -1, bounds: -1 };
     setPosition(newPosition);
 
     if (recognizerRef.current) {
@@ -261,10 +380,33 @@ export default function Teleprompter() {
     });
   };
 
+  const cycleAlign = () => {
+    const order: ("top" | "center" | "bottom")[] = ["top", "center", "bottom"];
+    const next = order[(order.indexOf(align) + 1) % order.length];
+    setAlign(next);
+    updateSetting("align", next);
+    Haptics.selectionAsync().catch(() => {});
+  };
+
+  const cycleOrientation = () => {
+    const order: ("portrait" | "landscape" | "system")[] = ["portrait", "landscape", "system"];
+    const next = order[(order.indexOf(orientationMode) + 1) % order.length];
+    setOrientationMode(next);
+    updateSetting("orientation", next);
+    Haptics.selectionAsync().catch(() => {});
+  };
+
+  const toggleMirror = () => {
+    const next = !mirror;
+    setMirror(next);
+    updateSetting("mirror", next);
+    Haptics.selectionAsync().catch(() => {});
+  };
+
   if (!script) {
     return (
-      <View style={styles.container}>
-        <Text>Loading...</Text>
+      <View style={[styles.container, styles.center]}>
+        <Text style={styles.loadingText}>Loading…</Text>
       </View>
     );
   }
@@ -272,73 +414,64 @@ export default function Teleprompter() {
   return (
     <View style={styles.container}>
       <StatusBar hidden />
+
       {/* Control Bar */}
       {isMenuVisible && (
-        <View style={[styles.controlBar, { paddingTop: insets.top + 8 }]}>
-          {/* Group 0: Back */}
-          <TouchableOpacity style={styles.controlButton} onPress={() => router.back()}>
-            <Ionicons name="close" size={28} color="#fff" />
-          </TouchableOpacity>
+        <View style={[styles.controlBar, { paddingTop: insets.top + 10 }]}>
+          {/* Transport */}
+          <View style={styles.group}>
+            <TouchableOpacity style={styles.iconBtn} onPress={() => router.back()} hitSlop={6}>
+              <Ionicons name="close" size={26} color={colors.text} />
+            </TouchableOpacity>
 
-          {/* Group 1: Play, Reset, Edit */}
-          <View style={styles.controlGroup}>
             <TouchableOpacity
               style={[styles.playButton, isPlaying && styles.playButtonActive]}
               onPress={togglePlayPause}
+              activeOpacity={0.85}
             >
-              <Ionicons name={isPlaying ? "pause" : "play"} size={28} color="#fff" />
+              <Ionicons
+                name={isPlaying ? "pause" : countdown !== null ? "ellipsis-horizontal" : "play"}
+                size={26}
+                color="#fff"
+              />
             </TouchableOpacity>
 
-            <TouchableOpacity style={styles.controlButton} onPress={resetScroll}>
-              <Ionicons name="refresh-outline" size={24} color="#fff" />
-              <Text style={styles.controlLabel}>Reset</Text>
-            </TouchableOpacity>
+            {isPlaying ? (
+              <View style={styles.listeningPill}>
+                <Animated.View style={[styles.listeningDot, { opacity: pulse }]} />
+                <Text style={styles.listeningText}>Listening</Text>
+              </View>
+            ) : (
+              <TouchableOpacity style={styles.labelBtn} onPress={resetScroll} hitSlop={6}>
+                <Ionicons name="refresh" size={22} color={colors.text} />
+                <Text style={styles.btnLabel}>Reset</Text>
+              </TouchableOpacity>
+            )}
 
             <TouchableOpacity
-              style={styles.controlButton}
+              style={styles.labelBtn}
               onPress={() => router.push(`/edit/${id}`)}
+              hitSlop={6}
             >
-              <Ionicons name="create-outline" size={24} color="#fff" />
-              <Text style={styles.controlLabel}>Edit</Text>
+              <Ionicons name="create-outline" size={22} color={colors.text} />
+              <Text style={styles.btnLabel}>Edit</Text>
             </TouchableOpacity>
           </View>
 
-          {/* Group 2: Align, Orientation, Mirror */}
-          <View style={styles.controlGroup}>
-            <TouchableOpacity
-              style={styles.controlButton}
-              onPress={() => {
-                const alignments: ("top" | "center" | "bottom")[] = ["top", "center", "bottom"];
-                const currentIndex = alignments.indexOf(align);
-                const nextAlign = alignments[(currentIndex + 1) % alignments.length];
-                setAlign(nextAlign);
-                updateSetting("align", nextAlign);
-              }}
-            >
+          <View style={styles.divider} />
+
+          {/* Layout */}
+          <View style={styles.group}>
+            <TouchableOpacity style={styles.labelBtn} onPress={cycleAlign} hitSlop={6}>
               <Ionicons
-                name={
-                  align === "top" ? "chevron-up" : align === "center" ? "remove" : "chevron-down"
-                }
-                size={24}
-                color="#fff"
+                name={align === "top" ? "chevron-up" : align === "center" ? "remove" : "chevron-down"}
+                size={22}
+                color={colors.text}
               />
-              <Text style={styles.controlLabel}>{align}</Text>
+              <Text style={styles.btnLabel}>{align}</Text>
             </TouchableOpacity>
 
-            <TouchableOpacity
-              style={styles.controlButton}
-              onPress={() => {
-                const modes: ("portrait" | "landscape" | "system")[] = [
-                  "portrait",
-                  "landscape",
-                  "system",
-                ];
-                const currentIndex = modes.indexOf(orientationMode);
-                const nextMode = modes[(currentIndex + 1) % modes.length];
-                setOrientationMode(nextMode);
-                updateSetting("orientation", nextMode);
-              }}
-            >
+            <TouchableOpacity style={styles.labelBtn} onPress={cycleOrientation} hitSlop={6}>
               <Ionicons
                 name={
                   orientationMode === "portrait"
@@ -347,50 +480,64 @@ export default function Teleprompter() {
                     ? "phone-landscape-outline"
                     : "sync-outline"
                 }
-                size={24}
-                color="#fff"
+                size={22}
+                color={colors.text}
               />
-              <Text style={styles.controlLabel}>{orientationMode}</Text>
+              <Text style={styles.btnLabel}>{orientationMode}</Text>
             </TouchableOpacity>
 
             <TouchableOpacity
-              style={[styles.controlButton, mirror && styles.controlButtonActive]}
-              onPress={() => {
-                const nextVal = !mirror;
-                setMirror(nextVal);
-                updateSetting("mirror", nextVal);
-              }}
+              style={[styles.labelBtn, mirror && styles.labelBtnActive]}
+              onPress={toggleMirror}
+              hitSlop={6}
             >
-              <Ionicons name="swap-horizontal-outline" size={24} color="#fff" />
-              <Text style={styles.controlLabel}>Mirror</Text>
+              <Ionicons
+                name="swap-horizontal-outline"
+                size={22}
+                color={mirror ? colors.accent : colors.text}
+              />
+              <Text style={[styles.btnLabel, mirror && styles.btnLabelActive]}>Mirror</Text>
             </TouchableOpacity>
           </View>
 
-          {/* Group 3: Font size, Margin */}
-          <View style={styles.controlGroup}>
-            <View style={styles.stepperContainer}>
-              <TouchableOpacity style={styles.controlButton} onPress={() => adjustFontSize(-4)}>
-                <Ionicons name="remove-circle-outline" size={24} color="#fff" />
+          <View style={styles.divider} />
+
+          {/* Text size & margin */}
+          <View style={styles.group}>
+            <View style={styles.stepper}>
+              <TouchableOpacity style={styles.stepBtn} onPress={() => adjustFontSize(-4)} hitSlop={6}>
+                <Ionicons name="remove" size={20} color={colors.text} />
               </TouchableOpacity>
-              <Ionicons name="text-outline" size={18} color="#fff" />
-              <TouchableOpacity style={styles.controlButton} onPress={() => adjustFontSize(4)}>
-                <Ionicons name="add-circle-outline" size={24} color="#fff" />
+              <View style={styles.stepReadout}>
+                <Ionicons name="text" size={16} color={colors.textMuted} />
+                <Text style={styles.stepValue}>{fontSize}</Text>
+              </View>
+              <TouchableOpacity style={styles.stepBtn} onPress={() => adjustFontSize(4)} hitSlop={6}>
+                <Ionicons name="add" size={20} color={colors.text} />
               </TouchableOpacity>
             </View>
 
-            <View style={styles.stepperContainer}>
-              <TouchableOpacity style={styles.controlButton} onPress={() => adjustMargin(-2)}>
-                <Ionicons name="remove-circle-outline" size={24} color="#fff" />
+            <View style={styles.stepper}>
+              <TouchableOpacity style={styles.stepBtn} onPress={() => adjustMargin(-2)} hitSlop={6}>
+                <Ionicons name="remove" size={20} color={colors.text} />
               </TouchableOpacity>
-              <MaterialCommunityIcons name="arrow-expand-horizontal" size={20} color="#fff" />
-              <TouchableOpacity style={styles.controlButton} onPress={() => adjustMargin(2)}>
-                <Ionicons name="add-circle-outline" size={24} color="#fff" />
+              <View style={styles.stepReadout}>
+                <MaterialCommunityIcons
+                  name="arrow-expand-horizontal"
+                  size={16}
+                  color={colors.textMuted}
+                />
+                <Text style={styles.stepValue}>{margin}</Text>
+              </View>
+              <TouchableOpacity style={styles.stepBtn} onPress={() => adjustMargin(2)} hitSlop={6}>
+                <Ionicons name="add" size={20} color={colors.text} />
               </TouchableOpacity>
             </View>
           </View>
         </View>
       )}
 
+      {/* Menu toggle handle */}
       <TouchableOpacity
         style={[
           styles.handleArea,
@@ -399,7 +546,7 @@ export default function Teleprompter() {
             top: 0,
             zIndex: 100,
             paddingTop: insets.top,
-            height: insets.top + 20,
+            height: insets.top + 22,
           },
         ]}
         onPress={() => setIsMenuVisible(!isMenuVisible)}
@@ -407,6 +554,18 @@ export default function Teleprompter() {
       >
         <View style={styles.handleBar} />
       </TouchableOpacity>
+
+      {/* Reading-line indicator (only while presenting) */}
+      {isPlaying && (
+        <View
+          pointerEvents="none"
+          style={[styles.readingLine, { top: windowHeight * ALIGN_FRACTION[align] }]}
+        >
+          <Ionicons name="caret-forward" size={16} color={colors.accent} />
+          <View style={styles.readingLineBar} />
+          <Ionicons name="caret-back" size={16} color={colors.accent} />
+        </View>
+      )}
 
       {/* Script Content */}
       <ScrollView
@@ -419,71 +578,75 @@ export default function Teleprompter() {
             paddingRight: `${margin * 0.8 - Math.min(fontSize / 80, 1) * 0.4}%`,
           },
         ]}
-        scrollEnabled={!isPlaying}
         showsVerticalScrollIndicator={false}
         scrollEventThrottle={16}
+        onScroll={(e) => {
+          scrollYRef.current = e.nativeEvent.contentOffset.y;
+        }}
+        onScrollBeginDrag={handleScrollBeginDrag}
+        onScrollEndDrag={handleScrollEndDrag}
+        onMomentumScrollEnd={handleMomentumScrollEnd}
       >
         <View style={styles.scriptContainer}>
           <View style={styles.tokenWrapper}>
-            {(() => {
-              const lines: Token[][] = [];
-              let currentLine: Token[] = [];
-              tokens.forEach((token) => {
-                if (token.value === "\n") {
-                  lines.push(currentLine);
-                  currentLine = [];
-                } else {
-                  currentLine.push(token);
-                }
-              });
-              lines.push(currentLine);
+            {lines.map((line, lineIndex) => (
+              <View
+                key={lineIndex}
+                onLayout={(e) => {
+                  lineYRef.current.set(lineIndex, e.nativeEvent.layout.y);
+                }}
+                style={{
+                  flexDirection: "row",
+                  flexWrap: "wrap",
+                  width: "100%",
+                  minHeight: line.tokens.length === 0 ? fontSize + 10 : 0,
+                }}
+              >
+                {line.tokens.map((token) => {
+                  const isHighlighted =
+                    isPlaying && token.index <= position.end && token.index > position.start;
+                  const isCurrent = isPlaying && token.index === position.end;
+                  const isPast = isPlaying && token.index <= position.start;
 
-              return lines.map((line, lineIndex) => (
-                <View
-                  key={lineIndex}
-                  style={{
-                    flexDirection: "row",
-                    flexWrap: "wrap",
-                    width: "100%",
-                    minHeight: line.length === 0 ? fontSize + 10 : 0,
-                  }}
-                >
-                  {line.map((token) => {
-                    const isHighlighted =
-                      isPlaying && token.index <= position.end && token.index > position.start;
-                    const isCurrent = isPlaying && token.index === position.end;
-                    const isPast = isPlaying && token.index <= position.start;
-
-                    return (
-                      <View
-                        key={token.index}
-                        ref={(ref) => {
-                          if (ref) {
-                            tokenRefs.current.set(token.index, ref);
-                          }
-                        }}
-                        style={styles.tokenContainer}
+                  return (
+                    <View
+                      key={token.index}
+                      ref={(ref) => {
+                        if (ref) tokenRefs.current.set(token.index, ref);
+                      }}
+                      style={styles.tokenContainer}
+                    >
+                      <Text
+                        style={[
+                          styles.scriptText,
+                          { fontSize, lineHeight: fontSize + 10 },
+                          isPast && styles.pastToken,
+                          isHighlighted && styles.highlightedToken,
+                          isCurrent && styles.currentToken,
+                        ]}
                       >
-                        <Text
-                          style={[
-                            styles.scriptText,
-                            { fontSize, lineHeight: fontSize + 10 },
-                            isPast && styles.pastToken,
-                            isHighlighted && styles.highlightedToken,
-                            isCurrent && styles.currentToken,
-                          ]}
-                        >
-                          {token.value}
-                        </Text>
-                      </View>
-                    );
-                  })}
-                </View>
-              ));
-            })()}
+                        {token.value}
+                      </Text>
+                    </View>
+                  );
+                })}
+              </View>
+            ))}
           </View>
         </View>
       </ScrollView>
+
+      {/* Countdown overlay */}
+      {countdown !== null && countdown > 0 && (
+        <TouchableOpacity
+          style={styles.countdownOverlay}
+          activeOpacity={1}
+          onPress={() => setCountdown(null)}
+        >
+          <Text style={styles.countdownNumber}>{countdown}</Text>
+          <Text style={styles.countdownHint}>Get ready… tap to cancel</Text>
+        </TouchableOpacity>
+      )}
     </View>
   );
 }
@@ -491,60 +654,156 @@ export default function Teleprompter() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: "#000",
+    backgroundColor: colors.background,
+  },
+  center: {
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  loadingText: {
+    color: colors.textMuted,
+    fontFamily: "Inter_400Regular",
   },
   controlBar: {
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "space-between",
     flexWrap: "wrap",
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    backgroundColor: "rgba(0, 0, 0, 0.8)",
+    paddingHorizontal: 14,
+    paddingBottom: 10,
+    backgroundColor: "rgba(10,10,10,0.92)",
     borderBottomWidth: 1,
-    borderBottomColor: "#222",
-    gap: 12,
+    borderBottomColor: colors.border,
+    gap: 10,
   },
-  controlGroup: {
+  group: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 12,
+    gap: 6,
   },
-  stepperContainer: {
-    flexDirection: "row",
-    alignItems: "center",
+  divider: {
+    width: 1,
+    alignSelf: "stretch",
+    marginVertical: 4,
+    backgroundColor: colors.border,
   },
-  controlButton: {
+  iconBtn: {
+    width: 44,
+    height: 44,
     alignItems: "center",
     justifyContent: "center",
-    minWidth: 40,
   },
-  controlButtonActive: {
-    opacity: 0.5,
+  labelBtn: {
+    minWidth: 52,
+    height: 44,
+    paddingHorizontal: 6,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 10,
   },
-  controlLabel: {
-    color: "#fff",
-    fontSize: 9,
-    fontFamily: "Inter_400Regular",
-    marginTop: 1,
+  labelBtnActive: {
+    backgroundColor: "rgba(10,132,255,0.15)",
+  },
+  btnLabel: {
+    color: colors.text,
+    fontSize: 10,
+    fontFamily: "Inter_500Medium",
+    marginTop: 2,
+    textTransform: "capitalize",
+  },
+  btnLabelActive: {
+    color: colors.accent,
   },
   playButton: {
-    width: 40,
-    height: 40,
-    borderRadius: 22,
-    backgroundColor: "#007AFF",
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: colors.accent,
     alignItems: "center",
     justifyContent: "center",
-    marginHorizontal: 4,
   },
   playButtonActive: {
-    backgroundColor: "#FF3B30",
+    backgroundColor: colors.danger,
+  },
+  listeningPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 10,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: "rgba(255,69,58,0.15)",
+  },
+  listeningDot: {
+    width: 9,
+    height: 9,
+    borderRadius: 5,
+    backgroundColor: colors.danger,
+  },
+  listeningText: {
+    color: colors.danger,
+    fontSize: 12,
+    fontFamily: "Inter_600SemiBold",
+  },
+  stepper: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: colors.surface,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  stepBtn: {
+    width: 38,
+    height: 40,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  stepReadout: {
+    minWidth: 40,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 2,
+  },
+  stepValue: {
+    color: colors.text,
+    fontSize: 12,
+    fontFamily: "Inter_600SemiBold",
+    marginTop: 1,
+  },
+  handleArea: {
+    width: "100%",
+    height: 12,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  handleBar: {
+    width: 100,
+    height: 5,
+    borderRadius: 2.5,
+    backgroundColor: "rgba(255,255,255,0.4)",
+  },
+  readingLine: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    height: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 8,
+    zIndex: 50,
+  },
+  readingLineBar: {
+    flex: 1,
+    height: 2,
+    marginHorizontal: 4,
+    backgroundColor: "rgba(10,132,255,0.35)",
   },
   scrollView: {
     flex: 1,
   },
   scrollContent: {
-    paddingTop: 80,
+    paddingTop: SCROLL_TOP_PADDING,
     paddingBottom: 200,
   },
   scriptContainer: {
@@ -559,31 +818,39 @@ const styles = StyleSheet.create({
     flexDirection: "row",
   },
   scriptText: {
-    color: "#fff",
+    color: colors.text,
     textAlign: "left",
     fontFamily: "Inter_400Regular",
     // For some reason adding padding stops text from being cut off
     paddingHorizontal: 0.0001,
   },
   highlightedToken: {
-    color: "#FFD700",
+    color: colors.highlight,
   },
   currentToken: {
-    color: "#FFD700",
+    color: "#000",
+    backgroundColor: colors.highlight,
+    borderRadius: 4,
   },
   pastToken: {
-    color: "#666",
+    color: colors.textFaint,
   },
-  handleArea: {
-    width: "100%",
-    height: 10,
+  countdownOverlay: {
+    ...StyleSheet.absoluteFillObject,
     alignItems: "center",
     justifyContent: "center",
+    backgroundColor: "rgba(0,0,0,0.75)",
+    zIndex: 200,
   },
-  handleBar: {
-    width: 100,
-    height: 5,
-    borderRadius: 1.5,
-    backgroundColor: "rgba(255, 255, 255, 0.5)",
+  countdownNumber: {
+    color: colors.text,
+    fontSize: 120,
+    fontFamily: "Inter_700Bold",
+  },
+  countdownHint: {
+    color: colors.textMuted,
+    fontSize: 15,
+    fontFamily: "Inter_500Medium",
+    marginTop: 8,
   },
 });
