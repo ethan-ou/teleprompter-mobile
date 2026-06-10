@@ -1,56 +1,131 @@
+import { assetModelPath } from "react-native-sherpa-onnx";
+import { createPcmLiveStream, type PcmLiveStreamHandle } from "react-native-sherpa-onnx/audio";
+import {
+  createStreamingSTT,
+  type StreamingSttEngine,
+  type SttStream,
+} from "react-native-sherpa-onnx/stt";
+import { PermissionsAndroid, Platform } from "react-native";
 import { ASREmitter } from "./emitter";
 import type { ASRAvailability, ASREngine } from "./types";
 
 /*
-  On-device streaming engine (PRIMARY TARGET) — sherpa-onnx streaming Zipformer.
+  On-device streaming engine (PRIMARY): sherpa-onnx streaming FastConformer
+  transducer (NeMo, en, 480ms, int8), bundled at assets/models/fast-conformer-en-480ms.
 
-  STATUS: scaffold. The native module (react-native-sherpa-onnx) and a streaming
-  model are not yet installed, so this engine reports `unavailable` and the
-  factory falls back to ExpoASREngine. The app keeps building until then.
-
-  CHOSEN MODEL (default candidate): sherpa-onnx-nemo-streaming-fast-conformer-
-    transducer-en-480ms-int8 (~100MB, newer than zipformer, selectable latency, good
-    far-field). Quality ceiling to benchmark: sherpa-onnx-nemotron-speech-streaming-
-    en-0.6b-160ms-int8-2026-04-25 (~600MB unpacked, best far-field, flagship-only).
-    Lightweight fallback: sherpa-onnx-streaming-zipformer-en-2023-06-21 (int8 ~179MB).
-    The `...ms` suffix is the model's algorithmic lookahead (latency vs accuracy) — sweep it.
-
-  To make this real (see docs/voice-asr-plan.md for the full recipe):
-    1. `npx expo install react-native-sherpa-onnx` and add its Expo config plugin.
-    2. Bundle the streaming model under assets as `models/streaming-zipformer-en`.
-    3. Rebuild the dev client (`expo run:android`) — native module, not Expo Go.
-    4. Implement start()/stop() with the lib's streaming API:
-         createStreamingSTT({ modelPath:{type:'asset',path:'models/streaming-zipformer-en'},
-           modelType:'transducer', enableEndpoint:true, enableInputNormalization:true,
-           endpointConfig:{ rule2:{ minTrailingSilence: 1.0, mustContainNonSilence:true } } })
-         + createPcmLiveStream({ sampleRate:16000 }); on each onData chunk call
-         stream.processAudioChunk(samples, sr): emit interim via emitResult("", result.text);
-         on isEndpoint emit final via emitResult(result.text, "") then stream.reset().
-       Keep the (final, interim) contract identical so the matcher is untouched.
-
-  Far-field tunables to validate in the benchmark harness:
-    - enableInputNormalization (adaptive gain to ~0.8 peak — on by default, key for far mic)
-    - endpoint rule2.minTrailingSilence (lower = snappier, too low clips low-energy words)
-    - numThreads / provider ('cpu' vs 'qnn') for realtime headroom
+  Flow: load model in prepare() (the expensive warm-up) -> open mic via the lib's
+  PCM live stream in start() -> feed chunks to the streaming recognizer -> emit
+  interim/final on the same (final, interim) contract the matcher already consumes.
+  Far-field knobs: enableInputNormalization (adaptive gain) + endpoint rule2.
 */
 
+const MODEL_ASSET = "models/fast-conformer-en-480ms";
+const SAMPLE_RATE = 16000;
+
 export class SherpaASREngine extends ASREmitter implements ASREngine {
+  private engine: StreamingSttEngine | null = null;
+  private stream: SttStream | null = null;
+  private pcm: PcmLiveStreamHandle | null = null;
+  private unsubData: (() => void) | null = null;
+  private unsubError: (() => void) | null = null;
+  private chain: Promise<void> = Promise.resolve();
+  private lastText = "";
+
   static availability(): ASRAvailability {
-    return {
-      available: false,
-      reason: "sherpa-onnx native module/model not installed yet (see docs/voice-asr-plan.md)",
-    };
+    // Native module + bundled model are present in this build.
+    return { available: true };
+  }
+
+  async prepare(): Promise<void> {
+    if (Platform.OS === "android") {
+      const granted = await PermissionsAndroid.request(
+        PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
+        {
+          title: "Microphone permission",
+          message: "Microphone access is required for on-device voice tracking.",
+          buttonPositive: "OK",
+        }
+      );
+      if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
+        throw new Error("Microphone permission not granted");
+      }
+    }
+
+    // Load the model — the heavy step we want done before the user hits play.
+    this.engine = await createStreamingSTT({
+      modelPath: assetModelPath(MODEL_ASSET),
+      modelType: "auto",
+      enableEndpoint: true,
+      enableInputNormalization: true,
+      endpointConfig: {
+        // Speech-then-silence ends an utterance. Trailing silence kept modest so
+        // low-energy far-field words aren't clipped.
+        rule2: { mustContainNonSilence: true, minTrailingSilence: 1.0, minUtteranceLength: 0 },
+      },
+    });
+    this.stream = await this.engine.createStream();
   }
 
   async start(): Promise<void> {
-    this.emitError({
-      code: "unavailable",
-      message: SherpaASREngine.availability().reason,
+    if (!this.engine) await this.prepare();
+    if (!this.stream && this.engine) this.stream = await this.engine.createStream();
+
+    this.lastText = "";
+    this.chain = Promise.resolve();
+
+    const pcm = createPcmLiveStream({ sampleRate: SAMPLE_RATE });
+    this.pcm = pcm;
+
+    this.unsubError = pcm.onError((message) => {
+      this.emitError({ code: "audio", message });
     });
-    this.emitEnd();
+
+    // Serialize chunk processing so native calls don't overlap.
+    this.unsubData = pcm.onData((samples, sr) => {
+      const frame = Array.from(samples);
+      this.chain = this.chain.then(() => this.processFrame(frame, sr));
+    });
+
+    await pcm.start();
+    this.emitStart();
+  }
+
+  private async processFrame(samples: number[], sampleRate: number): Promise<void> {
+    const stream = this.stream;
+    if (!stream) return;
+    try {
+      const { result, isEndpoint } = await stream.processAudioChunk(samples, sampleRate);
+      if (result.text && result.text !== this.lastText) {
+        this.lastText = result.text;
+        this.emitResult("", result.text); // interim
+      }
+      if (isEndpoint) {
+        if (result.text) this.emitResult(result.text, ""); // final
+        this.lastText = "";
+        await stream.reset();
+      }
+    } catch (error) {
+      console.warn("sherpa chunk error:", error);
+    }
   }
 
   stop(): void {
-    // no-op until implemented
+    this.pcm?.stop().catch(() => {});
+    this.unsubData?.();
+    this.unsubError?.();
+    this.unsubData = null;
+    this.unsubError = null;
+    this.pcm = null;
+    this.stream?.reset().catch(() => {});
+    this.lastText = "";
+  }
+
+  cleanup(): void {
+    super.cleanup();
+    this.stop();
+    this.stream?.release().catch(() => {});
+    this.engine?.destroy().catch(() => {});
+    this.stream = null;
+    this.engine = null;
   }
 }

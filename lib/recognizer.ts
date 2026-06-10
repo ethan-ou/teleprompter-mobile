@@ -92,15 +92,37 @@ export class TeleprompterRecognizer {
     if (this.prepared || this.preparing) return;
     this.preparing = true;
     try {
-      const engine = this.ensureEngine();
-      await engine.prepare?.();
+      await this.prepareEngine();
       this.prepared = true;
       this.callbacks.onReady?.();
     } catch (error) {
-      this.callbacks.onError?.(error);
+      // If the preferred (on-device) engine can't load, fall back to the
+      // always-available platform recognizer so voice control still works.
+      if (this.engineId !== "expo") {
+        console.warn("On-device ASR failed to load; falling back to platform engine:", error);
+        this.engineId = "expo";
+        if (this.speechRecognizer) {
+          this.speechRecognizer.cleanup();
+          this.speechRecognizer = null;
+        }
+        try {
+          await this.prepareEngine();
+          this.prepared = true;
+          this.callbacks.onReady?.();
+        } catch (fallbackError) {
+          this.callbacks.onError?.(fallbackError);
+        }
+      } else {
+        this.callbacks.onError?.(error);
+      }
     } finally {
       this.preparing = false;
     }
+  }
+
+  private async prepareEngine(): Promise<void> {
+    const engine = this.ensureEngine();
+    await engine.prepare?.();
   }
 
   isReady(): boolean {

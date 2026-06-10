@@ -191,25 +191,31 @@ export default function Teleprompter() {
     if (recognizerRef.current) {
       recognizerRef.current.updateTokens(tokens);
     } else {
-      recognizerRef.current = new TeleprompterRecognizer(tokens, {
-        onReady: () => setIsReady(true),
-        onStart: () => {
-          // Recognition is actually live now.
-          setIsStarting(false);
-          setIsPlaying(true);
+      recognizerRef.current = new TeleprompterRecognizer(
+        tokens,
+        {
+          onReady: () => setIsReady(true),
+          onStart: () => {
+            // Recognition is actually live now.
+            setIsStarting(false);
+            setIsPlaying(true);
+          },
+          onPositionUpdate: setPosition,
+          onError: (error) => {
+            console.error("Speech recognition error:", error);
+            Alert.alert("Voice Recognition Error", error.message || "An error occurred");
+            setIsStarting(false);
+            setIsPlaying(false);
+          },
+          onEnd: () => {
+            setIsStarting(false);
+            setIsPlaying(false);
+          },
         },
-        onPositionUpdate: setPosition,
-        onError: (error) => {
-          console.error("Speech recognition error:", error);
-          Alert.alert("Voice Recognition Error", error.message || "An error occurred");
-          setIsStarting(false);
-          setIsPlaying(false);
-        },
-        onEnd: () => {
-          setIsStarting(false);
-          setIsPlaying(false);
-        },
-      });
+        // Prefer the on-device model; recognizer falls back to the platform
+        // engine if the model can't load.
+        "sherpa"
+      );
       // Warm up the engine now so play is instant (and the mic prompt happens
       // on entry, not on first tap).
       recognizerRef.current.prepare();

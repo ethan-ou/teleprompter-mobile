@@ -44,3 +44,6 @@ app-example
 # generated native folders
 /ios
 /android
+
+# On-device STT model download temp (see scripts/fetch-model.sh)
+.model-tmp/
