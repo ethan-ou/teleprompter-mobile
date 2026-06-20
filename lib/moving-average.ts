@@ -1,6 +1,13 @@
 const MIN_AVERAGE = 2;
 const NUM_AVERAGE = 3;
 
+// Cap on the per-step forward momentum bias. Clamping to [0, MAX_MOMENTUM]
+// keeps only forward push (which carries the cursor through adjacent-word
+// oscillation) while preventing two failure modes of an unclamped bias: a
+// backward raw blip dragging the smoothed cursor further back, and a large
+// forward jump overshooting past where speech actually is.
+const MAX_MOMENTUM = 3;
+
 let positions: [number, number][] = [];
 
 export function calculateMovingAverage(start: number, end: number): [number, number] | undefined {
@@ -37,8 +44,10 @@ function weightedMovingAverage(array: number[]) {
   let prev;
 
   for (let i = 0; i < array.length; i++) {
-    // A hack to weigh averages closer to the last transcribed index.
-    let bias = prev !== undefined ? array[i] - prev : 0;
+    // Recency bias weighted toward the last transcribed index, clamped to only
+    // capped forward momentum so backward blips and large jumps don't destabilise
+    // the smoothed position.
+    const bias = prev !== undefined ? Math.min(Math.max(array[i] - prev, 0), MAX_MOMENTUM) : 0;
 
     const weighting = array.length - i;
     total += (array[i] + bias) * weighting;

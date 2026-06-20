@@ -1,21 +1,13 @@
-import {
-  createTextRegion,
-  getBoundsStart,
-  getTokensFromText,
-  matchText,
-  resetTranscriptWindow,
-} from "./speech-matcher";
-import SpeechRecognizer from "./speech-recognizer";
+import { createASREngine, type ASREngine, type ASREngineId } from "./asr";
+import { stepPosition, type Position } from "./match-engine";
+import { getBoundsStart, resetTranscriptWindow } from "./speech-matcher";
 import type { Token } from "./word-tokenizer";
 
-export type Position = {
-  start: number;
-  search: number;
-  end: number;
-  bounds: number;
-};
+export type { Position } from "./match-engine";
 
 export type RecognizerCallbacks = {
+  /** Engine prepared (permissions granted, model loaded) — safe to start. */
+  onReady?: () => void;
   onStart?: () => void;
   onPositionUpdate?: (position: Position) => void;
   onEnd?: () => void;
@@ -23,7 +15,8 @@ export type RecognizerCallbacks = {
 };
 
 export class TeleprompterRecognizer {
-  private speechRecognizer: SpeechRecognizer | null = null;
+  private speechRecognizer: ASREngine | null = null;
+  private engineId: ASREngineId;
   private tokens: Token[] = [];
   private position: Position = {
     start: -1,
@@ -33,9 +26,14 @@ export class TeleprompterRecognizer {
   };
   private callbacks: RecognizerCallbacks = {};
 
-  constructor(tokens: Token[], callbacks: RecognizerCallbacks = {}) {
+  private prepared = false;
+  private preparing = false;
+  private running = false;
+
+  constructor(tokens: Token[], callbacks: RecognizerCallbacks = {}, engineId: ASREngineId = "expo") {
     this.tokens = tokens;
     this.callbacks = callbacks;
+    this.engineId = engineId;
   }
 
   updateTokens(tokens: Token[]) {
@@ -51,96 +49,101 @@ export class TeleprompterRecognizer {
     return this.position;
   }
 
-  async start(): Promise<void> {
-    if (this.speechRecognizer !== null) {
-      return;
-    }
+  /** Create the engine once and wire its events. The engine is kept warm and
+   *  reused across start/stop so a preloaded model isn't thrown away. */
+  private ensureEngine(): ASREngine {
+    if (this.speechRecognizer) return this.speechRecognizer;
 
+    const engine = createASREngine(this.engineId);
+
+    engine.onstart(() => {
+      if (this.position.bounds < 0) {
+        const bounds = getBoundsStart(this.tokens, 0);
+        if (bounds !== undefined) {
+          this.updatePosition({ bounds });
+        }
+      }
+      this.callbacks.onStart?.();
+    });
+
+    engine.onresult((finalTranscript: string, interimTranscript: string) => {
+      const next = stepPosition(this.tokens, this.position, finalTranscript, interimTranscript);
+      this.updatePosition(next);
+    });
+
+    engine.onerror((error) => {
+      this.callbacks.onError?.(error);
+    });
+
+    engine.onend(() => {
+      this.running = false;
+      this.callbacks.onEnd?.();
+      resetTranscriptWindow();
+    });
+
+    this.speechRecognizer = engine;
+    return engine;
+  }
+
+  /** Warm up the engine ahead of time (request permissions, load the on-device
+   *  model). Call this on screen entry so `start()` is near-instant. Safe to
+   *  call multiple times. */
+  async prepare(): Promise<void> {
+    if (this.prepared || this.preparing) return;
+    this.preparing = true;
     try {
-      this.speechRecognizer = new SpeechRecognizer();
-
-      this.speechRecognizer.onstart(() => {
-        if (this.position.bounds < 0) {
-          const bounds = getBoundsStart(this.tokens, 0);
-          if (bounds !== undefined) {
-            this.updatePosition({ bounds });
-          }
-        }
-        this.callbacks.onStart?.();
-      });
-
-      this.speechRecognizer.onresult((finalTranscript: string, interimTranscript: string) => {
-        const textRegion = createTextRegion(this.tokens, this.position.search);
-        const boundStart = getBoundsStart(this.tokens, this.position.search, textRegion);
-
-        if (finalTranscript !== "") {
-          const foundMatch = matchText(
-            getTokensFromText(finalTranscript),
-            textRegion,
-            this.position.search,
-            true
-          );
-
-          if (foundMatch) {
-            const [, matchEnd] = foundMatch;
-            this.updatePosition({
-              start: matchEnd,
-              search: matchEnd,
-              end: matchEnd,
-              ...(boundStart !== undefined && { bounds: boundStart }),
-            });
-          } else {
-            this.updatePosition({
-              start: this.position.end,
-              search: this.position.end,
-              end: this.position.end,
-              ...(boundStart !== undefined && { bounds: boundStart }),
-            });
-          }
-        }
-
-        if (interimTranscript !== "") {
-          const foundMatch = matchText(
-            getTokensFromText(interimTranscript),
-            textRegion,
-            this.position.search,
-            false
-          );
-
-          if (foundMatch) {
-            const [matchStart, matchEnd] = foundMatch;
-            this.updatePosition({
-              search: matchStart,
-              end: matchEnd,
-              ...(boundStart !== undefined && { bounds: boundStart }),
-            });
-          }
-        }
-      });
-
-      this.speechRecognizer.onerror((error) => {
-        this.callbacks.onError?.(error);
-      });
-
-      this.speechRecognizer.onend(() => {
-        this.speechRecognizer = null;
-        this.callbacks.onEnd?.();
-        resetTranscriptWindow();
-      });
-
-      await this.speechRecognizer.start();
+      await this.prepareEngine();
+      this.prepared = true;
+      this.callbacks.onReady?.();
     } catch (error) {
+      // If the preferred (on-device) engine can't load, fall back to the
+      // always-available platform recognizer so voice control still works.
+      if (this.engineId !== "expo") {
+        console.warn("On-device ASR failed to load; falling back to platform engine:", error);
+        this.engineId = "expo";
+        if (this.speechRecognizer) {
+          this.speechRecognizer.cleanup();
+          this.speechRecognizer = null;
+        }
+        try {
+          await this.prepareEngine();
+          this.prepared = true;
+          this.callbacks.onReady?.();
+        } catch (fallbackError) {
+          this.callbacks.onError?.(fallbackError);
+        }
+      } else {
+        this.callbacks.onError?.(error);
+      }
+    } finally {
+      this.preparing = false;
+    }
+  }
+
+  private async prepareEngine(): Promise<void> {
+    const engine = this.ensureEngine();
+    await engine.prepare?.();
+  }
+
+  isReady(): boolean {
+    return this.prepared;
+  }
+
+  async start(): Promise<void> {
+    const engine = this.ensureEngine();
+    try {
+      this.running = true;
+      await engine.start();
+    } catch (error) {
+      this.running = false;
       this.callbacks.onError?.(error);
       throw error;
     }
   }
 
   stop(): void {
-    if (this.speechRecognizer !== null) {
-      this.speechRecognizer.stop();
-      this.speechRecognizer.cleanup();
-      this.speechRecognizer = null;
-    }
+    this.running = false;
+    this.speechRecognizer?.stop();
     resetTranscriptWindow();
   }
 
@@ -155,6 +158,18 @@ export class TeleprompterRecognizer {
   }
 
   isRunning(): boolean {
-    return this.speechRecognizer !== null;
+    return this.running;
+  }
+
+  /** Fully tear down the engine and free any loaded model. Call on unmount. */
+  dispose(): void {
+    this.running = false;
+    this.prepared = false;
+    if (this.speechRecognizer) {
+      this.speechRecognizer.stop();
+      this.speechRecognizer.cleanup();
+      this.speechRecognizer = null;
+    }
+    resetTranscriptWindow();
   }
 }
